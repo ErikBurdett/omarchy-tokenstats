@@ -6,16 +6,16 @@ have charged.
 
 ![Token Stats in the bar with its panel open](preview.png)
 
-The bar carries **one number** — tokens generated — because a bar widget that
-grows a row of figures stops being glanceable. Everything else is a hover or a
-click away.
+The bar carries **one number** — `TS: 8.2k tokens/hour` — because a bar widget
+that grows a row of figures stops being glanceable. Everything else is a hover
+or a click away.
 
 - **Hover** — prompt tokens, generation rate, savings, RAM available, and which
   model is resident.
 - **Click** — the panel: totals for any window, a bar graph, a history table,
   and the savings arithmetic with its assumptions printed next to it.
-- **Windows** — this hour, today, 7 days, 30 days, 12 months, or everything
-  still retained.
+- **Windows** — this hour (by minute), today (by hour), 7 days, 30 days,
+  12 months, or everything still retained.
 
 ## Counts are exact, not estimated
 
@@ -94,7 +94,8 @@ In **Setup > Plugins > Token Stats**, or on the widget's entry in
 
 | Setting | Default | What it does |
 |---|---|---|
-| Bar shows | `Today` | Window the bar number covers |
+| Bar shows | `Today` | Window the per-hour rate is averaged over |
+| Import history from OpenCode | `on` | Backfill exact counts from OpenCode's database |
 | Refresh (seconds) | `10` | One loopback request per refresh |
 | Cloud price per 1M prompt tokens | `3.00` | Set to the API you would otherwise use |
 | Cloud price per 1M generated tokens | `15.00` | |
@@ -119,10 +120,23 @@ Deltas land in hourly and daily buckets under
 `~/.local/state/omarchy/tokenstats/history.json`, written atomically at most
 once a minute. Retention is 72 hourly and 400 daily buckets — a few tens of KiB.
 
-History therefore starts when you install the plugin. Backfilling from
-llama-swap's request log was considered and rejected: those lines carry only
-response byte sizes, and mixing an order-of-magnitude-wrong estimate into an
-otherwise exact record would make every historical figure untrustworthy.
+### Backfill from OpenCode
+
+OpenCode records the provider's own `usage` block for every reply, so its
+database is an exact source for tokens generated before this widget existed or
+while the shell was not running. The plugin imports from it read-only, filtered
+to `providerID = local`, taking only rows between its watermark and the moment
+live sampling resumed — so nothing is ever counted twice.
+
+Imported rows carry **tokens only**. OpenCode's message wall clock includes tool
+calls and waiting: measured against this machine it reads 2 tok/s where the
+benchmark is 46. So imported tokens are recorded *unmetered*, and the displayed
+throughput is computed only from tokens this widget sampled itself. The panel
+says what the rate was measured on when the two differ.
+
+Backfilling from llama-swap's request log was considered and rejected: those
+lines carry only response byte sizes, which is the estimate this plugin exists
+to avoid.
 
 `Net saved` is the cloud cost of the same tokens minus the electricity your
 hardware actually spent generating them. It does not charge notional rent for

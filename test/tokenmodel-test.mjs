@@ -9,7 +9,8 @@ const M = {}
 new Function("exports", src + `;Object.assign(exports,{
   parseMetrics, parseLoadedModel, deltaFrom, hourKey, dayKey, emptyHistory,
   parseHistory, record, prune, totals, series, savings, formatTokens,
-  formatRate, formatMoney, periodLabel, periodKey, parseMeminfo, formatSize });`)(M)
+  formatRate, formatMoney, periodLabel, periodKey, parseMeminfo, formatSize,
+  minuteKey, touched, tokensPerHour, parseOpencodeRows, applyImport, elapsedHours });`)(M)
 
 let fails = 0
 const check = (name, actual, expected) => {
@@ -66,8 +67,8 @@ const now = new Date(2026, 8, 4, 13, 30)
 let h = M.emptyHistory()
 M.record(h, { promptTokens: 10, predictedTokens: 90, predictedSeconds: 3 }, now, 1)
 M.record(h, { promptTokens: 5, predictedTokens: 45, predictedSeconds: 1.5 }, now, 1)
-check("hour bucket accumulates", h.hours[M.hourKey(now)], { p: 15, c: 135, s: 4.5, n: 2 })
-check("day bucket accumulates", h.days[M.dayKey(now)], { p: 15, c: 135, s: 4.5, n: 2 })
+check("hour bucket accumulates", h.hours[M.hourKey(now)], { p: 15, c: 135, s: 4.5, n: 2, m: 135 })
+check("day bucket accumulates", h.days[M.dayKey(now)], { p: 15, c: 135, s: 4.5, n: 2, m: 135 })
 
 const earlier = new Date(2026, 8, 3, 9, 0)
 M.record(h, { promptTokens: 1, predictedTokens: 10, predictedSeconds: 1 }, earlier, 1)
@@ -78,7 +79,7 @@ check("all spans days", M.totals(h, "all", now).c, 145)
 
 console.log("persistence round trip")
 const round = M.parseHistory(JSON.stringify(h))
-check("survives round trip", round.days[M.dayKey(now)], { p: 15, c: 135, s: 4.5, n: 2 })
+check("survives round trip", round.days[M.dayKey(now)], { p: 15, c: 135, s: 4.5, n: 2, m: 135 })
 check("rejects wrong version", M.parseHistory('{"version":99,"days":{}}').days, {})
 check("rejects garbage", M.parseHistory("}{").days, {})
 check("rejects empty", M.parseHistory("").days, {})
@@ -125,6 +126,45 @@ check("money", M.formatMoney(3.14159, "$"), "$3.14")
 check("money big", M.formatMoney(1234.5, "$"), "$1235")
 check("money negative", M.formatMoney(-2.5, "$"), "-$2.50")
 check("label", M.periodLabel("week"), "7 days")
+
+console.log("metered vs imported")
+let mh = M.emptyHistory()
+const t0 = new Date(2026, 8, 4, 13, 30)
+M.record(mh, { promptTokens: 5, predictedTokens: 50, predictedSeconds: 1 }, t0, 0, true)
+M.record(mh, { promptTokens: 5, predictedTokens: 50, predictedSeconds: 0 }, t0, 0, false)
+const mb = mh.days[M.dayKey(t0)]
+check("all tokens counted", mb.c, 100)
+check("only metered tokens carry seconds", mb.m, 50)
+check("rate uses metered only", M.formatRate(mb.m, mb.s), "50.0 tok/s")
+check("minute bucket written", mh.minutes[M.minuteKey(t0)].c, 100)
+check("hour totals read minutes", M.totals(mh, "hour", t0).c, 100)
+
+console.log("reactivity helper")
+const orig = M.emptyHistory()
+check("touched returns a new identity", M.touched(orig) === orig, false)
+check("touched keeps the buckets", M.touched(orig).days === orig.days, true)
+
+console.log("opencode import")
+const ROWS = ["1788542714634|312|1|0", "1788542714700|100|500|20", "junk", "1788542714800|1|2"].join("\n")
+const parsed = M.parseOpencodeRows(ROWS, 0, Number.MAX_SAFE_INTEGER)
+check("valid rows only", parsed.length, 2)
+check("reasoning added to generated", parsed[1].predictedTokens, 520)
+check("imported rows carry no seconds", parsed[0].predictedSeconds, 0)
+check("watermark excludes older", M.parseOpencodeRows(ROWS, 1788542714650, Number.MAX_SAFE_INTEGER).length, 1)
+check("boundary excludes newer", M.parseOpencodeRows(ROWS, 0, 1788542714650).length, 1)
+check("empty input", M.parseOpencodeRows("", 0, 1), [])
+let ih = M.emptyHistory()
+const newest = M.applyImport(ih, parsed)
+check("newest timestamp returned", newest, 1788542714700)
+check("import is unmetered", M.totals(ih, "all", new Date(1788542714700)).m, 0)
+
+console.log("tokens per hour")
+let rh = M.emptyHistory()
+M.record(rh, { promptTokens: 0, predictedTokens: 3600, predictedSeconds: 10 }, new Date(2026, 8, 4, 12, 0), 0, true)
+check("week window is fully elapsed", M.elapsedHours("week", new Date(2026, 8, 4, 13, 0)), 168)
+check("day window uses elapsed", Math.round(M.elapsedHours("day", new Date(2026, 8, 4, 6, 0))), 6)
+check("rate over 7 days", Math.round(M.tokensPerHour(rh, "week", new Date(2026, 8, 4, 13, 0))), 21)
+check("no data is zero", M.tokensPerHour(M.emptyHistory(), "day", new Date()), 0)
 
 console.log("settings vocabulary")
 check("today", M.periodKey("Today"), "day")

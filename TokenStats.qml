@@ -32,6 +32,9 @@ BarWidget {
   readonly property real watts: Math.min(Math.max(Number(setting("systemWatts", 120)), 0), 2000)
   readonly property real pricePerKwh: Math.min(Math.max(Number(setting("pricePerKwh", 0.12)), 0), 10)
   readonly property string currencySymbol: String(setting("currencySymbol", "$")).substring(0, 3)
+  readonly property bool importOpencode: setting("importOpencode", true) === true
+  readonly property string opencodeDb: Quickshell.env("HOME") + "/.local/share/opencode/opencode.db"
+
   readonly property string endpoint: {
     // Only a loopback endpoint is accepted. This value is fetched by curl, so a
     // shell.json edit must not be able to point it at an arbitrary host.
@@ -57,7 +60,10 @@ BarWidget {
   property string pendingKind: ""
 
   readonly property var periodTotals: Model.totals(history, barPeriod, new Date())
-  readonly property string label: Model.formatTokens(periodTotals.c)
+  readonly property real perHour: Model.tokensPerHour(history, barPeriod, new Date())
+  readonly property string label: "TS: " + Model.formatTokens(perHour) + " tokens/hour"
+  // Left and right bars are narrow, so the caption and the unit go.
+  readonly property string shortLabel: Model.formatTokens(perHour)
 
   readonly property string statePath: Quickshell.env("HOME") + "/.local/state/omarchy/tokenstats/history.json"
 
@@ -85,15 +91,22 @@ BarWidget {
     if (!parsed) { loadedModel = ""; return }
     parsed.model = loadedModel
 
+    // A successful read means live accounting covers up to now, so the importer
+    // never has to reach back over a period we already counted.
+    if (root.historyLoaded) {
+      root.history.importedThrough = Date.now()
+      root.historyDirty = true
+    }
+
     var delta = Model.deltaFrom(lastSample, parsed)
     lastSample = parsed
     if (!delta || delta.reset) return
     if (delta.predictedTokens <= 0 && delta.promptTokens <= 0) return
 
-    Model.record(root.history, delta, new Date(), 0)
-    // Reassign so bindings on `history` re-evaluate; mutating in place would
-    // leave the label and the panel showing the previous totals.
-    root.history = root.history
+    Model.record(root.history, delta, new Date(), 0, true)
+    // A fresh top-level identity, because assigning the same object reference
+    // back would not notify anything and the label would sit at its old value.
+    root.history = Model.touched(root.history)
     historyDirty = true
   }
 
@@ -158,6 +171,8 @@ BarWidget {
   Component.onDestruction: {
     pollWatchdog.stop()
     pollProc.running = false
+    importWatchdog.stop()
+    importProc.running = false
     if (root.historyDirty) root.saveHistory()
   }
 
@@ -186,11 +201,13 @@ BarWidget {
     onLoaded: {
       root.history = Model.prune(Model.parseHistory(text()), new Date())
       root.historyLoaded = true
+      root.importOpencodeHistory()
     }
     onLoadFailed: {
       // No file yet on first run, which is not an error.
       root.history = Model.emptyHistory()
       root.historyLoaded = true
+      root.importOpencodeHistory()
     }
   }
 
@@ -208,6 +225,68 @@ BarWidget {
     running: true
     repeat: true
     onTriggered: if (root.historyDirty) root.saveHistory()
+  }
+
+  // ---------------------------------------------------------------- import
+
+  // OpenCode records exact per-reply token counts from the provider's usage
+  // block, so it can fill in everything generated before this widget existed or
+  // while the shell was not running. Only rows strictly between the watermark
+  // and the moment live sampling resumed are taken, so nothing is counted twice.
+  //
+  // Tokens only: the message wall clock includes tool calls and waiting, which
+  // reads as 2 tok/s against a benchmarked 46, so imported rows are recorded
+  // unmetered and do not move the displayed rate.
+  property real importBoundary: 0
+
+  function importOpencodeHistory() {
+    if (!importOpencode || !historyLoaded || importProc.running) return
+
+    var since = Math.round(Number(root.history.importedThrough) || 0)
+    if (!isFinite(since) || since < 0) since = 0
+    root.importBoundary = Date.now()
+
+    importProc.command = [
+      "/usr/bin/sqlite3", "-readonly", "-noheader", "-separator", "|",
+      "file:" + root.opencodeDb + "?mode=ro",
+      "select json_extract(data,'$.time.completed')," +
+      " json_extract(data,'$.tokens.input')," +
+      " json_extract(data,'$.tokens.output')," +
+      " json_extract(data,'$.tokens.reasoning')" +
+      " from message" +
+      " where json_extract(data,'$.role')='assistant'" +
+      "   and json_extract(data,'$.providerID')='local'" +
+      "   and json_extract(data,'$.time.completed') > " + since +
+      " order by 1 limit 20000;"
+    ]
+    importWatchdog.restart()
+    importProc.running = true
+  }
+
+  Process {
+    id: importProc
+    running: false
+    environment: ({})
+    stdout: StdioCollector { id: importOut; waitForEnd: true }
+    onExited: {
+      importWatchdog.stop()
+      var rows = Model.parseOpencodeRows(importOut.text,
+                                         Number(root.history.importedThrough) || 0,
+                                         root.importBoundary)
+      if (rows.length > 0) {
+        Model.applyImport(root.history, rows)
+        root.history.importedThrough = root.importBoundary
+        root.history = Model.touched(root.history)
+        root.historyDirty = true
+        root.saveHistory()
+      }
+    }
+  }
+
+  Timer {
+    id: importWatchdog
+    interval: 15000
+    onTriggered: importProc.running = false
   }
 
   // ---------------------------------------------------------------- panel
@@ -266,8 +345,9 @@ BarWidget {
 
   readonly property string tooltip: {
     var t = root.periodTotals
-    var lines = [Model.periodLabel(root.barPeriod) + ": " + Model.formatTokens(t.c) + " tokens generated"]
-    lines.push("Prompt: " + Model.formatTokens(t.p) + "   Rate: " + Model.formatRate(t.c, t.s))
+    var lines = [Model.periodLabel(root.barPeriod) + ": " + Model.formatTokens(root.perHour) + " tokens/hour"]
+    lines.push("Generated: " + Model.formatTokens(t.c) + "   Prompt: " + Model.formatTokens(t.p))
+    lines.push("Throughput while generating: " + Model.formatRate(t.m, t.s))
     var sv = Model.savings(t, root.rates)
     lines.push("Saved vs cloud: " + Model.formatMoney(sv.net, root.currencySymbol)
                + "  (at " + root.currencySymbol + root.inputPerMillion + "/"
@@ -287,7 +367,7 @@ BarWidget {
     anchors.fill: parent
     bar: root.bar
     // The bar carries the token count and nothing else.
-    text: root.label
+    text: root.vertical ? root.shortLabel : root.label
     fontSize: Style.font.caption
     tooltipText: root.tooltip
     onPressed: function(b) {

@@ -29,7 +29,17 @@ Panel {
   property string period: "day"
   property string view: "graph"
 
-  readonly property var now: new Date()
+  // Re-read while the panel is open. Evaluated once, this froze every total and
+  // the graph at the moment the panel was first loaded.
+  property var now: new Date()
+
+  Timer {
+    interval: 10000
+    running: root.opened
+    repeat: true
+    triggeredOnStart: true
+    onTriggered: root.now = new Date()
+  }
   readonly property var totals: Model.totals(history, period, now)
   readonly property var points: Model.series(history, period, now)
   readonly property var money: Model.savings(totals, rates)
@@ -38,6 +48,10 @@ Panel {
     for (var i = 0; i < points.length; i++) if (points[i].tokens > max) max = points[i].tokens
     return max
   }
+
+  readonly property string slotUnit: root.period === "hour" ? " / min"
+                                   : (root.period === "day" ? " / hour"
+                                   : (root.period === "year" ? " / month" : " / day"))
 
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
   readonly property color dim: Qt.darker(barForeground, 1.35)
@@ -71,7 +85,18 @@ Panel {
           fontFamily: root.fontFamily
           title: Model.formatTokens(root.totals.c)
           meta: "tokens generated"
-          detail: Model.periodLabel(root.period) + " · " + Model.formatRate(root.totals.c, root.totals.s)
+          // Throughput is only known for tokens this widget sampled itself.
+          // Imported history carries exact counts but no usable generation
+          // time, so say what the rate was measured on rather than implying it
+          // covers everything above it.
+          detail: {
+            var rate = Model.formatRate(root.totals.m, root.totals.s)
+            if (root.totals.m <= 0) return Model.periodLabel(root.period) + " · rate not sampled yet"
+            if (root.totals.m < root.totals.c * 0.95)
+              return Model.periodLabel(root.period) + " · " + rate + " on "
+                     + Model.formatTokens(root.totals.m) + " sampled"
+            return Model.periodLabel(root.period) + " · " + rate
+          }
         }
 
         // ---- Window selector.
@@ -111,6 +136,32 @@ Panel {
             fontSize: Style.font.caption
             tooltipText: "Every recorded slot with prompt and generated counts"
             onClicked: root.view = "history"
+          }
+        }
+
+        // A bar chart with no stated scale is decoration: every window looks
+        // "full" because the tallest bar is always the peak. Name the peak.
+        Row {
+          width: parent.width
+          visible: root.view === "graph" && root.peak > 0
+
+          Text {
+            width: parent.width / 2
+            textFormat: Text.PlainText
+            text: "peak " + Model.formatTokens(root.peak) + root.slotUnit
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          Text {
+            width: parent.width / 2
+            horizontalAlignment: Text.AlignRight
+            textFormat: Text.PlainText
+            text: Model.formatTokens(root.totals.c) + " total"
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
           }
         }
 

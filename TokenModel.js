@@ -13,6 +13,7 @@ var HISTORY_VERSION = 1
 
 // Retention. Hours drive the 24h graph, days drive everything longer. Both are
 // tiny: 72 hourly + 400 daily records is a few tens of KiB of JSON.
+var KEEP_MINUTES = 180
 var KEEP_HOURS = 72
 var KEEP_DAYS = 400
 
@@ -108,6 +109,10 @@ function deltaFrom(previous, current) {
 
 function pad(n) { return n < 10 ? "0" + n : String(n) }
 
+function minuteKey(date) {
+  return hourKey(date) + ":" + pad(date.getMinutes())
+}
+
 function hourKey(date) {
   return date.getFullYear() + "-" + pad(date.getMonth() + 1) + "-" + pad(date.getDate()) +
          "T" + pad(date.getHours())
@@ -121,10 +126,17 @@ function monthKey(date) {
   return date.getFullYear() + "-" + pad(date.getMonth() + 1)
 }
 
-function emptyBucket() { return { p: 0, c: 0, s: 0, n: 0 } }
+// p prompt tokens, c generated tokens, s measured generation seconds,
+// m generated tokens that came WITH measured seconds, n requests (reserved).
+//
+// m exists because imported history carries exact token counts but no usable
+// generation time — opencode's message wall clock includes tool calls and
+// waiting, which reads as 2 tok/s against a benchmarked 46. Rate is m/s, so an
+// imported bucket reports its tokens and declines to invent a rate.
+function emptyBucket() { return { p: 0, c: 0, s: 0, n: 0, m: 0 } }
 
 function emptyHistory() {
-  return { version: HISTORY_VERSION, hours: {}, days: {} }
+  return { version: HISTORY_VERSION, minutes: {}, hours: {}, days: {}, importedThrough: 0 }
 }
 
 // Accept only what we wrote, and only in the shape we wrote it. A state file is
@@ -142,7 +154,8 @@ function parseHistory(text) {
   if (!doc || typeof doc !== "object" || doc.version !== HISTORY_VERSION) return emptyHistory()
 
   var out = emptyHistory()
-  var groups = ["hours", "days"]
+  out.importedThrough = clampNonNeg(doc.importedThrough, Number.MAX_SAFE_INTEGER)
+  var groups = ["minutes", "hours", "days"]
   for (var g = 0; g < groups.length; g++) {
     var name = groups[g]
     var src = doc[name]
@@ -151,14 +164,18 @@ function parseHistory(text) {
     var limit = keys.length < 2000 ? keys.length : 2000
     for (var i = 0; i < limit; i++) {
       var k = keys[i]
-      if (!/^[0-9]{4}-[0-9]{2}(-[0-9]{2})?(T[0-9]{2})?$/.test(k)) continue
+      if (!/^[0-9]{4}-[0-9]{2}(-[0-9]{2})?(T[0-9]{2}(:[0-9]{2})?)?$/.test(k)) continue
       var b = src[k]
       if (!b || typeof b !== "object") continue
+      var c = clampNonNeg(b.c, Number.MAX_SAFE_INTEGER)
       out[name][k] = {
         p: clampNonNeg(b.p, Number.MAX_SAFE_INTEGER),
-        c: clampNonNeg(b.c, Number.MAX_SAFE_INTEGER),
+        c: c,
         s: clampNonNeg(b.s, Number.MAX_SAFE_INTEGER),
-        n: clampNonNeg(b.n, Number.MAX_SAFE_INTEGER)
+        n: clampNonNeg(b.n, Number.MAX_SAFE_INTEGER),
+        // Files written before `m` existed hold live-sampled data only, so the
+        // whole count was metered.
+        m: b.m === undefined ? c : clampNonNeg(b.m, Number.MAX_SAFE_INTEGER)
       }
     }
   }
@@ -167,16 +184,20 @@ function parseHistory(text) {
 
 // Fold one delta into both the hourly and daily bucket for `date`. Writing both
 // up front keeps reads trivial: no rollup pass has to run before a query.
-function record(history, delta, date, requestDelta) {
+function record(history, delta, date, requestDelta, metered) {
   if (!history || !delta) return history
-  var groups = [["hours", hourKey(date)], ["days", dayKey(date)]]
+  var isMetered = metered !== false
+  var groups = [["minutes", minuteKey(date)], ["hours", hourKey(date)], ["days", dayKey(date)]]
   for (var i = 0; i < groups.length; i++) {
     var group = groups[i][0], key = groups[i][1]
     var bucket = history[group][key] || emptyBucket()
     bucket.p += delta.promptTokens
     bucket.c += delta.predictedTokens
-    bucket.s += delta.predictedSeconds
     bucket.n += clampNonNeg(requestDelta, 100000)
+    if (isMetered) {
+      bucket.s += delta.predictedSeconds
+      bucket.m += delta.predictedTokens
+    }
     history[group][key] = bucket
   }
   return history
@@ -186,11 +207,14 @@ function record(history, delta, date, requestDelta) {
 // so the file cannot grow without bound.
 function prune(history, now) {
   if (!history) return emptyHistory()
+  var minuteCut = new Date(now.getTime() - KEEP_MINUTES * 60000)
   var hourCut = new Date(now.getTime() - KEEP_HOURS * 3600000)
   var dayCut = new Date(now.getTime() - KEEP_DAYS * 86400000)
-  var hk = hourKey(hourCut), dk = dayKey(dayCut)
+  var nk = minuteKey(minuteCut), hk = hourKey(hourCut), dk = dayKey(dayCut)
   var k
 
+  if (!history.minutes) history.minutes = {}
+  for (k in history.minutes) if (k < nk) delete history.minutes[k]
   for (k in history.hours) if (k < hk) delete history.hours[k]
   for (k in history.days) if (k < dk) delete history.days[k]
   return history
@@ -201,6 +225,7 @@ function prune(history, now) {
 function addInto(target, bucket) {
   target.p += bucket.p; target.c += bucket.c
   target.s += bucket.s; target.n += bucket.n
+  target.m += bucket.m === undefined ? bucket.c : bucket.m
   return target
 }
 
@@ -212,8 +237,13 @@ function totals(history, period, now) {
   var k
 
   if (period === "hour") {
-    var b = history.hours[hourKey(now)]
-    return b ? addInto(sum, b) : sum
+    // Summed from the minute buckets rather than the hourly one, so this total
+    // always agrees with the graph beside it — the two read the same rows.
+    var prefix = hourKey(now)
+    for (k in (history.minutes || {})) {
+      if (k.indexOf(prefix) === 0) addInto(sum, history.minutes[k])
+    }
+    return sum
   }
   if (period === "day") {
     var d = history.days[dayKey(now)]
@@ -235,7 +265,19 @@ function series(history, period, now) {
   var out = []
   var i, d, key, b
 
-  if (period === "hour" || period === "day") {
+  if (period === "hour") {
+    // 60 one-minute slots. Without this the hour view was a copy of the day
+    // view, which is what made the graph look wrong.
+    for (i = 59; i >= 0; i--) {
+      d = new Date(now.getTime() - i * 60000)
+      key = minuteKey(d)
+      b = history && history.minutes && history.minutes[key]
+      out.push({ label: pad(d.getMinutes()), tokens: b ? b.c : 0, key: key })
+    }
+    return out
+  }
+
+  if (period === "day") {
     for (i = 23; i >= 0; i--) {
       d = new Date(now.getTime() - i * 3600000)
       key = hourKey(d)
@@ -375,4 +417,120 @@ function formatSize(kib) {
   if (!isNum(kib) || kib < 0) return "—"
   return kib >= 1048576 ? (kib / 1048576).toFixed(1) + " GiB"
                         : (kib / 1024).toFixed(0) + " MiB"
+}
+
+
+// ---------------------------------------------------------------- rates
+
+// Hours actually elapsed inside a window, so a rate early in the day is not
+// divided by a full 24 hours. Trailing windows (week/month/year) are complete
+// by definition; calendar windows (hour/day) are only partly through.
+function elapsedHours(period, now) {
+  var ms
+  switch (period) {
+    case "hour":
+      ms = now.getMinutes() * 60000 + now.getSeconds() * 1000
+      return Math.max(ms / 3600000, 1 / 60)
+    case "day":
+      ms = now.getTime() - new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime()
+      return Math.max(ms / 3600000, 1 / 60)
+    case "week":  return 7 * 24
+    case "month": return 30 * 24
+    case "year":  return 365 * 24
+    default:      return 0
+  }
+}
+
+// Tokens per hour across a window. "all" measures from the oldest day still
+// retained rather than assuming a window length.
+function tokensPerHour(history, period, now) {
+  var bucket = totals(history, period, now)
+  var hours = elapsedHours(period, now)
+
+  if (period === "all" || hours <= 0) {
+    var oldest = null
+    for (var k in (history && history.days ? history.days : {})) {
+      if (oldest === null || k < oldest) oldest = k
+    }
+    if (oldest === null) return 0
+    var parts = oldest.split("-")
+    var start = new Date(Number(parts[0]), Number(parts[1]) - 1, Number(parts[2]))
+    hours = Math.max((now.getTime() - start.getTime()) / 3600000, 1 / 60)
+  }
+
+  if (!isNum(bucket.c) || hours <= 0) return 0
+  return bucket.c / hours
+}
+
+// ---------------------------------------------------------------- import
+
+// One row per assistant reply from OpenCode's database:
+//   completedMs|inputTokens|outputTokens|reasoningTokens
+// Token counts there come from the provider's own usage block, so they are
+// exact — but the message wall clock is not generation time (it includes tool
+// calls and waiting), so imported rows carry tokens only and are recorded
+// unmetered.
+function parseOpencodeRows(text, notBefore, notAfter) {
+  var raw = String(text === undefined || text === null ? "" : text)
+  if (raw.length === 0 || raw.length > MAX_STATE_BYTES) return []
+
+  var lines = raw.split("\n")
+  var limit = lines.length < 40000 ? lines.length : 40000
+  var out = []
+  var floor = isNum(notBefore) ? notBefore : 0
+  var ceiling = isNum(notAfter) ? notAfter : Number.MAX_SAFE_INTEGER
+
+  for (var i = 0; i < limit; i++) {
+    var line = lines[i]
+    if (line.length === 0) continue
+    var f = line.split("|")
+    if (f.length < 4) continue
+
+    var when = parseInt(f[0], 10)
+    if (!isNum(when) || when <= floor || when >= ceiling) continue
+
+    var input = parseInt(f[1], 10)
+    var output = parseInt(f[2], 10)
+    var reasoning = parseInt(f[3], 10)
+    if (!isNum(output)) continue
+
+    out.push({
+      when: when,
+      promptTokens: clampNonNeg(input, MAX_TOKENS_PER_SAMPLE),
+      predictedTokens: clampNonNeg(output, MAX_TOKENS_PER_SAMPLE) +
+                       clampNonNeg(isNum(reasoning) ? reasoning : 0, MAX_TOKENS_PER_SAMPLE),
+      predictedSeconds: 0
+    })
+  }
+  return out
+}
+
+// Fold imported rows in, newest timestamp returned so the caller can advance
+// its watermark and never import the same reply twice.
+function applyImport(history, rows) {
+  var newest = 0
+  for (var i = 0; i < rows.length; i++) {
+    var row = rows[i]
+    if (row.predictedTokens <= 0 && row.promptTokens <= 0) continue
+    record(history, row, new Date(row.when), 1, false)
+    if (row.when > newest) newest = row.when
+  }
+  return newest
+}
+
+// Return a new top-level object sharing the same bucket maps.
+//
+// QML will not re-evaluate bindings when a `var` property is assigned the same
+// object reference it already holds, so mutating history in place and then
+// writing `root.history = root.history` updates nothing. Swapping in a fresh
+// identity is cheap — five references — and is what actually notifies.
+function touched(history) {
+  if (!history) return emptyHistory()
+  return {
+    version: history.version,
+    minutes: history.minutes,
+    hours: history.hours,
+    days: history.days,
+    importedThrough: history.importedThrough
+  }
 }
