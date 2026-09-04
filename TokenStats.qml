@@ -65,7 +65,8 @@ BarWidget {
   // Left and right bars are narrow, so the caption and the unit go.
   readonly property string shortLabel: Model.formatTokens(perHour)
 
-  readonly property string statePath: Quickshell.env("HOME") + "/.local/state/omarchy/tokenstats/history.json"
+  readonly property string stateDir: Quickshell.env("HOME") + "/.local/state/omarchy/tokenstats"
+  readonly property string statePath: stateDir + "/history.json"
 
   // ---------------------------------------------------------------- polling
 
@@ -116,8 +117,17 @@ BarWidget {
   }
 
   Component.onCompleted: {
+    // A fresh install has no state directory, and FileView will not create one,
+    // so the first write would fail silently and history would never persist.
+    mkdirProc.running = true
     historyFile.reload()
     refresh()
+  }
+
+  Process {
+    id: mkdirProc
+    running: false
+    command: ["/usr/bin/mkdir", "-p", root.stateDir]
   }
 
   Process {
@@ -178,6 +188,7 @@ BarWidget {
     importProc.running = false
     sessionsWatchdog.stop()
     sessionsProc.running = false
+    launchWatchdog.stop()
     if (root.historyDirty) root.saveHistory()
   }
 
@@ -361,6 +372,17 @@ BarWidget {
   Process {
     id: launchProc
     running: false
+    onExited: launchWatchdog.stop()
+    onRunningChanged: if (running) launchWatchdog.restart()
+  }
+
+  // omarchy-launch-tui detaches and returns immediately; this only exists so a
+  // wedged exec cannot leave the Process permanently "running" and block the
+  // next click, since a running Process cannot be re-run.
+  Timer {
+    id: launchWatchdog
+    interval: 10000
+    onTriggered: launchProc.running = false
   }
 
   // ---------------------------------------------------------------- panel
