@@ -1,0 +1,147 @@
+# Token Stats
+
+Exact token counts from your local LLMs in the Omarchy bar, with a graph,
+browsable history, and an honest comparison against what a hosted API would
+have charged.
+
+![Token Stats in the bar with its panel open](preview.png)
+
+The bar carries **one number** — tokens generated — because a bar widget that
+grows a row of figures stops being glanceable. Everything else is a hover or a
+click away.
+
+- **Hover** — prompt tokens, generation rate, savings, RAM available, and which
+  model is resident.
+- **Click** — the panel: totals for any window, a bar graph, a history table,
+  and the savings arithmetic with its assumptions printed next to it.
+- **Windows** — this hour, today, 7 days, 30 days, 12 months, or everything
+  still retained.
+
+## Counts are exact, not estimated
+
+Token counts come from llama.cpp's own Prometheus counters
+(`llamacpp:prompt_tokens_total`, `llamacpp:tokens_predicted_total`), reached
+through llama-swap at `/upstream/<model>/metrics`. They match the `usage` block
+of the API response exactly.
+
+The obvious alternative — estimating tokens from HTTP response size — is wrong
+by more than an order of magnitude, because a streamed response is mostly SSE
+framing rather than content. On the machine this was written for, that approach
+implied 1,742 tok/s against a measured 46–50. There is deliberately no
+bytes-per-token constant anywhere in this plugin.
+
+## Requirements
+
+- Omarchy 4 (Quattro) with `omarchy-shell`
+- `llama-swap` on loopback, with llama.cpp's metrics endpoint enabled
+
+Add `--metrics` to your llama-server arguments. In a llama-swap `config.yaml`
+that uses a shared macro:
+
+```yaml
+macros:
+  server: >
+    /usr/bin/llama-server
+    --host 127.0.0.1
+    --port ${PORT}
+    --metrics
+```
+
+Then `systemctl --user restart llama-swap`. Without it the upstream returns
+501 and the widget simply reads zero.
+
+Only `curl` is required beyond that. Nothing else is installed, and nothing runs
+as root.
+
+## Install
+
+```bash
+omarchy plugin add https://github.com/ErikBurdett/omarchy-tokenstats.git --enable
+```
+
+Or by hand:
+
+```bash
+git clone https://github.com/ErikBurdett/omarchy-tokenstats.git \
+  ~/.config/omarchy/plugins/io.github.erikburdett.tokenstats
+omarchy-shell shell rescanPlugins
+omarchy plugin enable io.github.erikburdett.tokenstats left
+```
+
+## Remove
+
+```bash
+omarchy plugin disable io.github.erikburdett.tokenstats
+omarchy plugin remove io.github.erikburdett.tokenstats --yes
+rm -rf ~/.local/state/omarchy/tokenstats      # recorded history, if you want it gone
+```
+
+To take it off the bar but keep it installed, run only the `disable` line.
+
+## Position
+
+Defaults to the left section, and goes anywhere:
+
+```bash
+omarchy bar move io.github.erikburdett.tokenstats --section right
+omarchy bar move io.github.erikburdett.tokenstats --after omarchy.clock
+```
+
+## Settings
+
+In **Setup > Plugins > Token Stats**, or on the widget's entry in
+`~/.config/omarchy/shell.json`.
+
+| Setting | Default | What it does |
+|---|---|---|
+| Bar shows | `Today` | Window the bar number covers |
+| Refresh (seconds) | `10` | One loopback request per refresh |
+| Cloud price per 1M prompt tokens | `3.00` | Set to the API you would otherwise use |
+| Cloud price per 1M generated tokens | `15.00` | |
+| System draw while generating (W) | `120` | Used to cost your own electricity |
+| Electricity price per kWh | `0.12` | |
+| Currency symbol | `$` | |
+| llama-swap endpoint | `http://127.0.0.1:8080` | Loopback only; anything else is ignored |
+
+The default cloud prices are a *stated assumption*, not a measurement — the
+plugin cannot know which service you would otherwise have used. They are printed
+on the panel next to the savings figure so the number is never a hidden guess.
+
+## How the numbers are produced
+
+Counters are cumulative per llama-server process, so the plugin records
+**deltas** between polls. When llama-swap swaps models the counter restarts at
+zero; a reading lower than the last one is treated as a re-baseline and banks
+nothing, rather than recording a negative or mistaking the new absolute value
+for a delta.
+
+Deltas land in hourly and daily buckets under
+`~/.local/state/omarchy/tokenstats/history.json`, written atomically at most
+once a minute. Retention is 72 hourly and 400 daily buckets — a few tens of KiB.
+
+History therefore starts when you install the plugin. Backfilling from
+llama-swap's request log was considered and rejected: those lines carry only
+response byte sizes, and mixing an order-of-magnitude-wrong estimate into an
+otherwise exact record would make every historical figure untrustworthy.
+
+`Net saved` is the cloud cost of the same tokens minus the electricity your
+hardware actually spent generating them. It does not charge notional rent for
+memory or hardware you already own.
+
+## Cost of running it
+
+One `curl` per refresh against loopback, plus two `FileView` reads. No log
+tailing, no repeated multi-megabyte parse, and nothing polls the upstream while
+no model is resident.
+
+## Development
+
+`TokenModel.js` is Qt-free and covered by the test suite:
+
+```bash
+node test/tokenmodel-test.mjs
+```
+
+## License
+
+MIT — see [LICENSE](LICENSE).
