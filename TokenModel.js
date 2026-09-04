@@ -9,7 +9,11 @@
 // magnitude, because a streamed response is mostly SSE framing rather than
 // content. Never reintroduce a bytes-per-token constant here.
 
-var HISTORY_VERSION = 1
+// Bumped to 2 when per-model attribution was added. parseHistory rejects an
+// older file outright, which resets the watermark and triggers a full re-import
+// from OpenCode — cheap, and it rebuilds the history WITH model attribution
+// rather than leaving old buckets permanently unattributed.
+var HISTORY_VERSION = 2
 
 // Retention. Hours drive the 24h graph, days drive everything longer. Both are
 // tiny: 72 hourly + 400 daily records is a few tens of KiB of JSON.
@@ -22,6 +26,9 @@ var KEEP_DAYS = 400
 var MAX_TOKENS_PER_SAMPLE = 10000000
 var MAX_SECONDS_PER_SAMPLE = 3600
 var MAX_STATE_BYTES = 4194304
+// A corrupted or hand-edited file must not be able to explode the per-model map.
+var MAX_MODELS_PER_BUCKET = 32
+var MAX_MODEL_NAME = 40
 
 function isNum(v) { return typeof v === "number" && isFinite(v) }
 function clampNonNeg(v, cap) {
@@ -133,7 +140,55 @@ function monthKey(date) {
 // generation time — opencode's message wall clock includes tool calls and
 // waiting, which reads as 2 tok/s against a benchmarked 46. Rate is m/s, so an
 // imported bucket reports its tokens and declines to invent a rate.
-function emptyBucket() { return { p: 0, c: 0, s: 0, n: 0, m: 0 } }
+function emptyBucket() { return { p: 0, c: 0, s: 0, n: 0, m: 0, byModel: {} } }
+
+// Model ids come from llama-swap and from OpenCode's records, so they are
+// sanitised before being used as object keys.
+function modelKey(name) {
+  var raw = String(name === undefined || name === null ? "" : name).trim()
+  if (raw.length === 0) return ""
+  var cleaned = raw.replace(/[^A-Za-z0-9._-]/g, "")
+  return cleaned.substring(0, MAX_MODEL_NAME)
+}
+
+function addModel(bucket, model, delta, metered) {
+  var key = modelKey(model)
+  if (key === "") return
+  if (!bucket.byModel) bucket.byModel = {}
+  if (!bucket.byModel[key]) {
+    if (Object.keys(bucket.byModel).length >= MAX_MODELS_PER_BUCKET) return
+    bucket.byModel[key] = { p: 0, c: 0, s: 0, m: 0 }
+  }
+  var slot = bucket.byModel[key]
+  slot.p += delta.promptTokens
+  slot.c += delta.predictedTokens
+  if (metered) {
+    slot.s += delta.predictedSeconds
+    slot.m += delta.predictedTokens
+  }
+}
+
+// Every per-model figure is re-validated on the way in, and the map is capped.
+function parseByModel(src) {
+  var out = {}
+  if (!src || typeof src !== "object") return out
+  var keys = Object.keys(src)
+  var limit = keys.length < MAX_MODELS_PER_BUCKET ? keys.length : MAX_MODELS_PER_BUCKET
+  for (var i = 0; i < limit; i++) {
+    var key = modelKey(keys[i])
+    if (key === "") continue
+    var v = src[keys[i]]
+    if (!v || typeof v !== "object") continue
+    var c = clampNonNeg(v.c, Number.MAX_SAFE_INTEGER)
+    out[key] = {
+      p: clampNonNeg(v.p, Number.MAX_SAFE_INTEGER),
+      c: c,
+      s: clampNonNeg(v.s, Number.MAX_SAFE_INTEGER),
+      m: v.m === undefined ? c : clampNonNeg(v.m, Number.MAX_SAFE_INTEGER)
+    }
+  }
+  return out
+}
 
 function emptyHistory() {
   return { version: HISTORY_VERSION, minutes: {}, hours: {}, days: {}, importedThrough: 0 }
@@ -175,7 +230,8 @@ function parseHistory(text) {
         n: clampNonNeg(b.n, Number.MAX_SAFE_INTEGER),
         // Files written before `m` existed hold live-sampled data only, so the
         // whole count was metered.
-        m: b.m === undefined ? c : clampNonNeg(b.m, Number.MAX_SAFE_INTEGER)
+        m: b.m === undefined ? c : clampNonNeg(b.m, Number.MAX_SAFE_INTEGER),
+        byModel: parseByModel(b.byModel)
       }
     }
   }
@@ -184,7 +240,7 @@ function parseHistory(text) {
 
 // Fold one delta into both the hourly and daily bucket for `date`. Writing both
 // up front keeps reads trivial: no rollup pass has to run before a query.
-function record(history, delta, date, requestDelta, metered) {
+function record(history, delta, date, requestDelta, metered, model) {
   if (!history || !delta) return history
   var isMetered = metered !== false
   var groups = [["minutes", minuteKey(date)], ["hours", hourKey(date)], ["days", dayKey(date)]]
@@ -198,6 +254,7 @@ function record(history, delta, date, requestDelta, metered) {
       bucket.s += delta.predictedSeconds
       bucket.m += delta.predictedTokens
     }
+    addModel(bucket, model, delta, isMetered)
     history[group][key] = bucket
   }
   return history
@@ -226,7 +283,39 @@ function addInto(target, bucket) {
   target.p += bucket.p; target.c += bucket.c
   target.s += bucket.s; target.n += bucket.n
   target.m += bucket.m === undefined ? bucket.c : bucket.m
+
+  var src = bucket.byModel || {}
+  if (!target.byModel) target.byModel = {}
+  for (var key in src) {
+    if (!target.byModel[key]) target.byModel[key] = { p: 0, c: 0, s: 0, m: 0 }
+    var into = target.byModel[key], from = src[key]
+    into.p += from.p; into.c += from.c
+    into.s += from.s; into.m += from.m === undefined ? from.c : from.m
+  }
   return target
+}
+
+// Per-model rows for the panel, biggest first, with each model's share of the
+// window. Sorting here rather than in QML keeps the view declarative.
+function modelBreakdown(bucket) {
+  var out = []
+  var src = (bucket && bucket.byModel) || {}
+  var total = 0
+  var key
+
+  for (key in src) total += src[key].c
+  for (key in src) {
+    out.push({
+      model: key,
+      prompt: src[key].p,
+      tokens: src[key].c,
+      seconds: src[key].s,
+      metered: src[key].m === undefined ? src[key].c : src[key].m,
+      share: total > 0 ? (src[key].c / total) * 100 : 0
+    })
+  }
+  out.sort(function (a, b) { return b.tokens - a.tokens })
+  return out
 }
 
 // Totals for a named window. "all" sums the daily buckets, which is every day
@@ -496,6 +585,7 @@ function parseOpencodeRows(text, notBefore, notAfter) {
 
     out.push({
       when: when,
+      model: f.length > 4 ? modelKey(f[4]) : "",
       promptTokens: clampNonNeg(input, MAX_TOKENS_PER_SAMPLE),
       predictedTokens: clampNonNeg(output, MAX_TOKENS_PER_SAMPLE) +
                        clampNonNeg(isNum(reasoning) ? reasoning : 0, MAX_TOKENS_PER_SAMPLE),
@@ -512,7 +602,7 @@ function applyImport(history, rows) {
   for (var i = 0; i < rows.length; i++) {
     var row = rows[i]
     if (row.predictedTokens <= 0 && row.promptTokens <= 0) continue
-    record(history, row, new Date(row.when), 1, false)
+    record(history, row, new Date(row.when), 1, false, row.model)
     if (row.when > newest) newest = row.when
   }
   return newest

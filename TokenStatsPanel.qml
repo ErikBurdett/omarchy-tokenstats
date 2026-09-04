@@ -43,6 +43,7 @@ Panel {
   readonly property var totals: Model.totals(history, period, now)
   readonly property var points: Model.series(history, period, now)
   readonly property var money: Model.savings(totals, rates)
+  readonly property var byModel: Model.modelBreakdown(totals)
   readonly property real peak: {
     var max = 0
     for (var i = 0; i < points.length; i++) if (points[i].tokens > max) max = points[i].tokens
@@ -291,6 +292,74 @@ Panel {
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
               }
+            }
+          }
+        }
+
+        PanelSeparator {
+          width: parent.width
+          foreground: root.barForeground
+          visible: root.byModel.length > 0
+        }
+
+        PanelSectionHeader {
+          text: "By model"
+          foreground: root.barForeground
+          fontFamily: root.fontFamily
+          visible: root.byModel.length > 0
+        }
+
+        Repeater {
+          model: root.byModel
+
+          Row {
+            required property var modelData
+            width: content.width
+
+            Text {
+              width: parent.width * 0.34
+              elide: Text.ElideRight
+              textFormat: Text.PlainText
+              // A model id is a string from llama-swap, so it is rendered
+              // literally rather than as possible markup.
+              text: modelData.model
+              color: root.barForeground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+
+            Text {
+              width: parent.width * 0.30
+              horizontalAlignment: Text.AlignRight
+              textFormat: Text.PlainText
+              text: Model.formatTokens(modelData.tokens)
+              color: root.barForeground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+
+            Text {
+              width: parent.width * 0.16
+              horizontalAlignment: Text.AlignRight
+              textFormat: Text.PlainText
+              text: Math.round(modelData.share) + "%"
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+
+            Text {
+              width: parent.width * 0.20
+              horizontalAlignment: Text.AlignRight
+              textFormat: Text.PlainText
+              // Blank rather than a dash when this model has no sampled
+              // throughput: the tokens are still exact, the rate simply is not
+              // known for imported history.
+              text: modelData.metered > 0 && modelData.seconds > 0
+                    ? Model.formatRate(modelData.metered, modelData.seconds) : ""
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
             }
           }
         }

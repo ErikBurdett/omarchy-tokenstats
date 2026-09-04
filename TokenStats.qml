@@ -103,7 +103,7 @@ BarWidget {
     if (!delta || delta.reset) return
     if (delta.predictedTokens <= 0 && delta.promptTokens <= 0) return
 
-    Model.record(root.history, delta, new Date(), 0, true)
+    Model.record(root.history, delta, new Date(), 0, true, root.loadedModel)
     // A fresh top-level identity, because assigning the same object reference
     // back would not notify anything and the label would sit at its old value.
     root.history = Model.touched(root.history)
@@ -252,7 +252,8 @@ BarWidget {
       "select json_extract(data,'$.time.completed')," +
       " json_extract(data,'$.tokens.input')," +
       " json_extract(data,'$.tokens.output')," +
-      " json_extract(data,'$.tokens.reasoning')" +
+      " json_extract(data,'$.tokens.reasoning')," +
+      " json_extract(data,'$.modelID')" +
       " from message" +
       " where json_extract(data,'$.role')='assistant'" +
       "   and json_extract(data,'$.providerID')='local'" +

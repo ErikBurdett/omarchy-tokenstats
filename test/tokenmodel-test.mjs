@@ -10,7 +10,8 @@ new Function("exports", src + `;Object.assign(exports,{
   parseMetrics, parseLoadedModel, deltaFrom, hourKey, dayKey, emptyHistory,
   parseHistory, record, prune, totals, series, savings, formatTokens,
   formatRate, formatMoney, periodLabel, periodKey, parseMeminfo, formatSize,
-  minuteKey, touched, tokensPerHour, parseOpencodeRows, applyImport, elapsedHours });`)(M)
+  minuteKey, touched, tokensPerHour, parseOpencodeRows, applyImport, elapsedHours,
+  modelKey, modelBreakdown });`)(M)
 
 let fails = 0
 const check = (name, actual, expected) => {
@@ -67,8 +68,8 @@ const now = new Date(2026, 8, 4, 13, 30)
 let h = M.emptyHistory()
 M.record(h, { promptTokens: 10, predictedTokens: 90, predictedSeconds: 3 }, now, 1)
 M.record(h, { promptTokens: 5, predictedTokens: 45, predictedSeconds: 1.5 }, now, 1)
-check("hour bucket accumulates", h.hours[M.hourKey(now)], { p: 15, c: 135, s: 4.5, n: 2, m: 135 })
-check("day bucket accumulates", h.days[M.dayKey(now)], { p: 15, c: 135, s: 4.5, n: 2, m: 135 })
+check("hour bucket accumulates", h.hours[M.hourKey(now)], { p: 15, c: 135, s: 4.5, n: 2, m: 135, byModel: {} })
+check("day bucket accumulates", h.days[M.dayKey(now)], { p: 15, c: 135, s: 4.5, n: 2, m: 135, byModel: {} })
 
 const earlier = new Date(2026, 8, 3, 9, 0)
 M.record(h, { promptTokens: 1, predictedTokens: 10, predictedSeconds: 1 }, earlier, 1)
@@ -79,14 +80,14 @@ check("all spans days", M.totals(h, "all", now).c, 145)
 
 console.log("persistence round trip")
 const round = M.parseHistory(JSON.stringify(h))
-check("survives round trip", round.days[M.dayKey(now)], { p: 15, c: 135, s: 4.5, n: 2, m: 135 })
-check("rejects wrong version", M.parseHistory('{"version":99,"days":{}}').days, {})
+check("survives round trip", round.days[M.dayKey(now)], { p: 15, c: 135, s: 4.5, n: 2, m: 135, byModel: {} })
+check("rejects a newer version", M.parseHistory('{"version":99,"days":{}}').days, {})
 check("rejects garbage", M.parseHistory("}{").days, {})
 check("rejects empty", M.parseHistory("").days, {})
 check("rejects oversized", M.parseHistory("x".repeat(5000000)).days, {})
-check("drops bogus keys", M.parseHistory('{"version":1,"days":{"../etc":{"p":1,"c":1,"s":1,"n":1}}}').days, {})
+check("drops bogus keys", M.parseHistory('{"version":2,"days":{"../etc":{"p":1,"c":1,"s":1,"n":1}}}').days, {})
 check("clamps negatives",
-      M.parseHistory('{"version":1,"days":{"2026-09-04":{"p":-5,"c":10,"s":1,"n":1}}}').days["2026-09-04"].p, 0)
+      M.parseHistory('{"version":2,"days":{"2026-09-04":{"p":-5,"c":10,"s":1,"n":1}}}').days["2026-09-04"].p, 0)
 
 console.log("prune")
 let old = M.emptyHistory()
@@ -138,6 +139,36 @@ check("only metered tokens carry seconds", mb.m, 50)
 check("rate uses metered only", M.formatRate(mb.m, mb.s), "50.0 tok/s")
 check("minute bucket written", mh.minutes[M.minuteKey(t0)].c, 100)
 check("hour totals read minutes", M.totals(mh, "hour", t0).c, 100)
+
+console.log("per-model attribution")
+let pm = M.emptyHistory()
+const pt = new Date(2026, 8, 4, 13, 30)
+M.record(pm, { promptTokens: 10, predictedTokens: 900, predictedSeconds: 20 }, pt, 0, true, "coder")
+M.record(pm, { promptTokens: 5, predictedTokens: 100, predictedSeconds: 0 }, pt, 0, false, "reason")
+const bd = M.modelBreakdown(M.totals(pm, "day", pt))
+check("sorted biggest first", bd.map(r => r.model), ["coder", "reason"])
+check("tokens attributed", bd[0].tokens, 900)
+check("share computed", Math.round(bd[0].share), 90)
+check("imported model is unmetered", bd[1].metered, 0)
+check("metered model keeps seconds", bd[0].seconds, 20)
+check("no model is not attributed",
+      M.modelBreakdown(M.totals((() => { const h = M.emptyHistory()
+        M.record(h, { promptTokens: 1, predictedTokens: 1, predictedSeconds: 0 }, pt, 0, true, "")
+        return h })(), "day", pt)).length, 0)
+
+console.log("model key sanitising")
+check("plain", M.modelKey("coder"), "coder")
+check("path traversal stripped", M.modelKey("../../etc/passwd"), "....etcpasswd")
+check("trimmed", M.modelKey("  reason  "), "reason")
+check("empty", M.modelKey(""), "")
+check("null", M.modelKey(null), "")
+check("length capped", M.modelKey("x".repeat(80)).length, 40)
+
+console.log("per-model round trip")
+const pmr = M.parseHistory(JSON.stringify(pm))
+check("byModel survives", M.modelBreakdown(pmr.days[M.dayKey(pt)])[0].tokens, 900)
+check("version 2 accepted", pmr.version, 2)
+check("version 1 rejected", M.parseHistory('{"version":1,"days":{}}').days, {})
 
 console.log("reactivity helper")
 const orig = M.emptyHistory()

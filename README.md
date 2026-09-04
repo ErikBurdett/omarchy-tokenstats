@@ -13,7 +13,10 @@ or a click away.
 - **Hover** — prompt tokens, generation rate, savings, RAM available, and which
   model is resident.
 - **Click** — the panel: totals for any window, a bar graph, a history table,
-  and the savings arithmetic with its assumptions printed next to it.
+  a per-model breakdown, and the savings arithmetic with its assumptions
+  printed next to it.
+- **By model** — how many tokens each model produced, its share of the window,
+  and its measured throughput where one was sampled.
 - **Windows** — this hour (by minute), today (by hour), 7 days, 30 days,
   12 months, or everything still retained.
 
@@ -147,6 +150,14 @@ memory or hardware you already own.
 One `curl` per refresh against loopback, plus two `FileView` reads. No log
 tailing, no repeated multi-megabyte parse, and nothing polls the upstream while
 no model is resident.
+
+## History format versions
+
+`history.json` carries a `version`. A file written by an older version is
+rejected rather than migrated, which resets the watermark and triggers a full
+re-import from OpenCode — cheap, and it rebuilds history in the current shape
+instead of leaving old buckets permanently missing new fields. Version 2 added
+per-model attribution.
 
 ## Development
 
