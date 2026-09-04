@@ -1,0 +1,12 @@
+version: 2
+updates:
+  # The workflow pins every action by commit sha, which is the right default
+  # for supply-chain safety but means nothing updates on its own. Dependabot
+  # raises the pin bumps so they arrive as reviewable pull requests.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: "ci"
+    labels: ["ci"]

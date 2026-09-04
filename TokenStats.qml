@@ -1,3 +1,8 @@
+// Delegates below reference ids from this component (root, content).
+// Bound makes that lookup explicit and checkable rather than relying on
+// dynamic scope, which is what qmllint's "unqualified access" flags.
+pragma ComponentBehavior: Bound
+
 import QtQuick
 import Quickshell
 import Quickshell.Io
@@ -133,9 +138,9 @@ BarWidget {
   Process {
     id: pollProc
     running: false
-    // curl inherits nothing it does not need. The URL is loopback-only by
-    // construction (see `endpoint`), and the argv array leaves no shell to quote.
-    environment: ({})
+    // No environment override: these commands need nothing special, and the
+    // safety here comes from the absolute path and the argv array — there is no
+    // shell to quote for and no PATH lookup to hijack.
     stdout: StdioCollector { id: pollOut; waitForEnd: true }
     onExited: {
       pollWatchdog.stop()
@@ -283,7 +288,6 @@ BarWidget {
   Process {
     id: importProc
     running: false
-    environment: ({})
     stdout: StdioCollector { id: importOut; waitForEnd: true }
     onExited: {
       importWatchdog.stop()
@@ -342,7 +346,6 @@ BarWidget {
   Process {
     id: sessionsProc
     running: false
-    environment: ({})
     stdout: StdioCollector { id: sessionsOut; waitForEnd: true }
     onExited: {
       sessionsWatchdog.stop()

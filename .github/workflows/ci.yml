@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Least privilege: nothing here needs to write to the repository.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    name: Unit tests and packaging
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.0
+        with:
+          persist-credentials: false
+
+      - name: Validate manifest JSON
+        run: python3 -m json.tool manifest.json > /dev/null
+
+      - name: Model unit tests
+        run: node test/tokenmodel-test.mjs
+
+      - name: Packaging checks
+        run: bash scripts/qa.sh
+
+  qml:
+    name: QML lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Linted on Arch because that is what Omarchy is, so the plugin is checked
+    # against the Qt its users actually run. Pinned by digest so the image
+    # cannot move underneath an untouched pull request.
+    container:
+      image: archlinux@sha256:82b1b08faae9d61e3e7e13d562f4d09114d939105b0d59ff34140f3bd418593a
+    steps:
+      # quickshell supplies the Quickshell QML module the widget imports for
+      # Process, FileView and IpcHandler; without it every one of those
+      # resolves to nothing and the gate reports import failures rather than
+      # real defects. Installed before checkout so actions/checkout finds git.
+      - name: Install Qt QML tooling
+        run: pacman -Syu --noconfirm --needed qt6-declarative quickshell git
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.0
+        with:
+          persist-credentials: false
+
+      # qs.Commons and qs.Ui are root-relative Quickshell imports that only
+      # resolve against an Omarchy shell tree, so standalone qmllint needs one
+      # checked out beside the plugin. Pinned to a commit: an unpinned lint
+      # dependency turns an upstream edit into a red build on an untouched PR.
+      - name: Check out the Omarchy shell that supplies qs.Commons and qs.Ui
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.0
+        with:
+          repository: basecamp/omarchy
+          ref: 346e69e1cec6c4e8924531874af6ba010a1bc99e # v4.0.2
+          path: omarchy
+          persist-credentials: false
+
+      # Catches what the unit tests cannot: a QML type or property that never
+      # resolves. That is not a parse error, so it reaches a user as a widget
+      # that silently shows nothing.
+      #
+      # Two categories stay informational because standalone tooling cannot see
+      # them, not because they are acceptable:
+      #   missing-property        - the injected bar host is a bare QtObject
+      #   signal-handler-parameters - Process.exited carries QProcess::ExitStatus
+      - name: Lint QML
+        run: |
+          qmllint=/usr/lib/qt6/bin/qmllint
+          "$qmllint" --version
+          if ! "$qmllint" --silent --max-warnings 0 \
+            --missing-property info --signal-handler-parameters info \
+            -I omarchy/shell \
+            -i omarchy/shell/Commons/qmldir \
+            -i omarchy/shell/Ui/qmldir \
+            *.qml; then
+            echo "::error::qmllint reported warnings" >&2
+            "$qmllint" --max-warnings 0 \
+              --missing-property info --signal-handler-parameters info \
+              -I omarchy/shell \
+              -i omarchy/shell/Commons/qmldir \
+              -i omarchy/shell/Ui/qmldir \
+              *.qml 2>&1 | grep -E '^(Warning|Error):' >&2 || true
+            exit 1
+          fi

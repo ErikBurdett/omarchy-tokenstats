@@ -1,0 +1,63 @@
+name: Bug report
+description: Something in the widget behaves incorrectly
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For anything security-shaped, please use a
+        [private advisory](https://github.com/ErikBurdett/omarchy-tokenstats/security/advisories/new)
+        instead of a public issue.
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you saw, and what you expected instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open the panel
+        2. Select the Week window
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: log
+    attributes:
+      label: Shell log
+      description: |
+        `quickshell list --all` then `quickshell log -i <instance> -t 40`.
+        Any line mentioning `io.github.erikburdett.tokenstats` is the useful part.
+      render: shell
+
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: Output of `omarchy-version`, and your plugin version from `manifest.json`.
+      placeholder: "Omarchy 4.0.2, plugin 1.0.0"
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: metrics
+    attributes:
+      label: Metrics endpoint
+      description: |
+        Token counts read zero without it. Check with
+        `curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8080/upstream/<model>/metrics`
+      options:
+        - label: "`--metrics` is set on llama-server and the endpoint does not return 501"
+
+  - type: textarea
+    id: screenshot
+    attributes:
+      label: Screenshot
+      description: If the problem is visible, a picture settles it fastest.

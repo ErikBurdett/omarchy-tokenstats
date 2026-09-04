@@ -1,3 +1,8 @@
+// Delegates below reference ids from this component (root, content).
+// Bound makes that lookup explicit and checkable rather than relying on
+// dynamic scope, which is what qmllint's "unqualified access" flags.
+pragma ComponentBehavior: Bound
+
 import QtQuick
 import qs.Commons
 import qs.Ui
@@ -216,7 +221,7 @@ Panel {
                 required property var modelData
                 required property int index
                 readonly property bool hovered: root.hoverIndex === index
-                readonly property bool boundary: Model.isBoundary(modelData)
+                readonly property bool boundary: Model.isBoundary(slot.modelData)
                 width: (content.width - (root.points.length - 1)) / root.points.length
                 height: parent.height
 
@@ -240,11 +245,11 @@ Panel {
                   // Guarded against a zero peak so an empty window cannot
                   // divide by zero and paint a NaN-height bar.
                   height: root.peak > 0
-                    ? Math.max(Math.round((parent.height - Style.space(16)) * (modelData.tokens / root.peak)), modelData.tokens > 0 ? 2 : 0)
+                    ? Math.max(Math.round((parent.height - Style.space(16)) * (slot.modelData.tokens / root.peak)), slot.modelData.tokens > 0 ? 2 : 0)
                     : 0
                   radius: Style.space(2)
-                  color: modelData.tokens > 0 ? root.barForeground : "transparent"
-                  opacity: slot.hovered ? 1 : (index === root.points.length - 1 ? 0.95 : 0.5)
+                  color: slot.modelData.tokens > 0 ? root.barForeground : "transparent"
+                  opacity: slot.hovered ? 1 : (slot.index === root.points.length - 1 ? 0.95 : 0.5)
                 }
 
                 Text {
@@ -258,8 +263,8 @@ Panel {
                   // hovered slot's label on a thinned axis collided with its
                   // neighbours. The floating readout carries that detail now.
                   text: (root.points.length <= 8
-                         || index % Math.ceil(root.points.length / 8) === 0)
-                        ? Model.axisLabel(modelData) : ""
+                         || slot.index % Math.ceil(root.points.length / 8) === 0)
+                        ? Model.axisLabel(slot.modelData) : ""
                   color: slot.hovered ? root.barForeground : root.dim
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
@@ -353,13 +358,14 @@ Panel {
                 }
 
                 Row {
+                  id: historyRow
                   required property var modelData
                   width: rows.width
 
                   Text {
                     width: parent.width * 0.45
                     textFormat: Text.PlainText
-                    text: modelData.key
+                    text: historyRow.modelData.key
                     color: root.dim
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.bodySmall
@@ -369,7 +375,7 @@ Panel {
                     width: parent.width * 0.55
                     horizontalAlignment: Text.AlignRight
                     textFormat: Text.PlainText
-                    text: Model.formatTokens(modelData.tokens) + " tokens"
+                    text: Model.formatTokens(historyRow.modelData.tokens) + " tokens"
                     color: root.barForeground
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.bodySmall
@@ -501,6 +507,7 @@ Panel {
           model: root.byModel
 
           Row {
+            id: modelRow
             required property var modelData
             width: content.width
             visible: root.view !== "sessions"
@@ -511,7 +518,7 @@ Panel {
               textFormat: Text.PlainText
               // A model id is a string from llama-swap, so it is rendered
               // literally rather than as possible markup.
-              text: modelData.model
+              text: modelRow.modelData.model
               color: root.barForeground
               font.family: root.fontFamily
               font.pixelSize: Style.font.bodySmall
@@ -521,7 +528,7 @@ Panel {
               width: parent.width * 0.30
               horizontalAlignment: Text.AlignRight
               textFormat: Text.PlainText
-              text: Model.formatTokens(modelData.tokens)
+              text: Model.formatTokens(modelRow.modelData.tokens)
               color: root.barForeground
               font.family: root.fontFamily
               font.pixelSize: Style.font.bodySmall
@@ -531,7 +538,7 @@ Panel {
               width: parent.width * 0.16
               horizontalAlignment: Text.AlignRight
               textFormat: Text.PlainText
-              text: Math.round(modelData.share) + "%"
+              text: Math.round(modelRow.modelData.share) + "%"
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.bodySmall
@@ -544,8 +551,8 @@ Panel {
               // Blank rather than a dash when this model has no sampled
               // throughput: the tokens are still exact, the rate simply is not
               // known for imported history.
-              text: modelData.metered > 0 && modelData.seconds > 0
-                    ? Model.formatRate(modelData.metered, modelData.seconds) : ""
+              text: modelRow.modelData.metered > 0 && modelRow.modelData.seconds > 0
+                    ? Model.formatRate(modelRow.modelData.metered, modelRow.modelData.seconds) : ""
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.bodySmall
@@ -576,6 +583,7 @@ Panel {
           ]
 
           Row {
+            id: costRow
             required property var modelData
             required property int index
             width: content.width
@@ -584,7 +592,7 @@ Panel {
             Text {
               width: parent.width * 0.55
               textFormat: Text.PlainText
-              text: modelData.key
+              text: costRow.modelData.key
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.bodySmall
@@ -594,11 +602,11 @@ Panel {
               width: parent.width * 0.45
               horizontalAlignment: Text.AlignRight
               textFormat: Text.PlainText
-              text: modelData.value
+              text: costRow.modelData.value
               color: root.barForeground
               font.family: root.fontFamily
               font.pixelSize: Style.font.bodySmall
-              font.bold: index === 4
+              font.bold: costRow.index === 4
             }
           }
         }

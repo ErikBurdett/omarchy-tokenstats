@@ -189,11 +189,26 @@ per-model attribution.
 
 ## Development
 
-`TokenModel.js` is Qt-free and covered by the test suite:
+`TokenModel.js` is Qt-free and covered by the test suite. CI runs all of these
+on every pull request:
 
 ```bash
-node test/tokenmodel-test.mjs
+node test/tokenmodel-test.mjs        # the model layer
+bash scripts/qa.sh                   # packaging and safety
+omarchy plugin validate .            # manifest against the shell's schema
 ```
+
+Plus `qmllint` against a pinned Omarchy shell tree, which catches the failure
+mode testing cannot: a QML type or property that never resolves. See
+[CONTRIBUTING.md](CONTRIBUTING.md) for the invocation and the house rules.
+
+## Contributing
+
+Pull requests welcome — start with [CONTRIBUTING.md](CONTRIBUTING.md). Please
+read [SECURITY.md](SECURITY.md) before reporting anything security-shaped, and
+[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) for how discussion works here.
+
+Changes are recorded in [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
