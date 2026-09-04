@@ -31,6 +31,9 @@ Panel {
   property var sessions: []
   // -1 when nothing is under the pointer.
   property int hoverIndex: -1
+  // Pointer position inside the chart, for placing the floating readout.
+  property real hoverX: 0
+  property real hoverY: 0
   readonly property var hoveredPoint: (hoverIndex >= 0 && hoverIndex < points.length)
                                       ? points[hoverIndex] : null
 
@@ -244,13 +247,6 @@ Panel {
                   opacity: slot.hovered ? 1 : (index === root.points.length - 1 ? 0.95 : 0.5)
                 }
 
-                MouseArea {
-                  anchors.fill: parent
-                  hoverEnabled: true
-                  onEntered: root.hoverIndex = slot.index
-                  onExited: if (root.hoverIndex === slot.index) root.hoverIndex = -1
-                }
-
                 Text {
                   id: labelText
                   anchors.bottom: parent.bottom
@@ -258,7 +254,10 @@ Panel {
                   textFormat: Text.PlainText
                   // Thin the axis rather than overprinting it, and always keep
                   // the slot under the pointer legible.
-                  text: (slot.hovered || root.points.length <= 8
+                  // Deliberately NOT forced visible on hover: printing the
+                  // hovered slot's label on a thinned axis collided with its
+                  // neighbours. The floating readout carries that detail now.
+                  text: (root.points.length <= 8
                          || index % Math.ceil(root.points.length / 8) === 0)
                         ? Model.axisLabel(modelData) : ""
                   color: slot.hovered ? root.barForeground : root.dim
@@ -268,19 +267,59 @@ Panel {
               }
             }
           }
+
+          // One tracker across the whole chart rather than a MouseArea per bar:
+          // the pointer never falls between slots, and the readout can follow it.
+          MouseArea {
+            id: chartMouse
+            anchors.fill: parent
+            hoverEnabled: true
+            onPositionChanged: function (mouse) {
+              if (root.points.length === 0) return
+              var slotWidth = width / root.points.length
+              if (slotWidth <= 0) return
+              var idx = Math.floor(mouse.x / slotWidth)
+              root.hoverIndex = Math.max(0, Math.min(root.points.length - 1, idx))
+              root.hoverX = mouse.x
+              root.hoverY = mouse.y
+            }
+            onExited: root.hoverIndex = -1
+          }
+
+          // Floating readout, placed beside the pointer and clamped inside the
+          // chart so it never runs off either edge.
+          Rectangle {
+            id: readout
+            visible: root.hoveredPoint !== null && root.view === "graph"
+            width: readoutText.implicitWidth + Style.space(12)
+            height: readoutText.implicitHeight + Style.space(8)
+            radius: Style.space(3)
+            color: root.bar ? root.bar.background : Color.background
+            border.width: 1
+            border.color: Qt.rgba(root.barForeground.r, root.barForeground.g, root.barForeground.b, 0.35)
+            x: Math.max(0, Math.min(parent.width - width, root.hoverX + Style.space(12)))
+            y: Math.max(0, Math.min(parent.height - height, root.hoverY - height - Style.space(6)))
+
+            Text {
+              id: readoutText
+              anchors.centerIn: parent
+              textFormat: Text.PlainText
+              text: root.hoveredPoint ? Model.pointDetail(root.hoveredPoint) : ""
+              color: root.barForeground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+          }
         }
 
-        // Hover readout. Falls back to the window total so the line is never
-        // just empty space.
+        // Steady summary under the chart; the hover detail floats instead.
         Text {
           width: parent.width
           visible: root.view === "graph"
           elide: Text.ElideRight
           textFormat: Text.PlainText
-          text: root.hoveredPoint
-                ? Model.pointDetail(root.hoveredPoint)
-                : Model.formatTokens(root.totals.c) + " tokens in this window  ·  hover a bar for detail"
-          color: root.hoveredPoint ? root.barForeground : root.dim
+          text: Model.formatTokens(root.totals.c) + " tokens in this window  ·  hover a bar for detail"
+          color: root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
         }

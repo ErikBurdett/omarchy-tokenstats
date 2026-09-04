@@ -15,10 +15,12 @@ or a click away.
 - **Click** — the panel: totals for any window, a bar graph, a history table,
   a sessions list, a per-model breakdown, and the savings arithmetic with its
   assumptions printed next to it.
-- **Graph** — hover any bar for its exact date, time span and token count. The
-  axis carries real dates, and a rule marks each day boundary.
-- **Sessions** — your OpenCode sessions ranked by tokens generated. **Click one
-  to resume it** in a terminal, in its own working directory.
+- **Graph** — hover any bar and a readout follows the pointer with the exact
+  weekday, date, time span and token count. The axis carries real dates, and a
+  rule marks each day boundary.
+- **Sessions** — your OpenCode sessions ranked by tokens generated, titled from
+  what you actually asked for. **Click one to resume it** in a terminal, in its
+  own working directory.
 - **By model** — how many tokens each model produced, its share of the window,
   and its measured throughput where one was sampled.
 - **Windows** — this hour (by minute), today (by hour), 7 days, 30 days,

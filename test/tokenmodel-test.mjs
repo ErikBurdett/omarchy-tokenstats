@@ -243,19 +243,30 @@ const SROWS = [
 const sess = M.parseSessions(SROWS)
 check("valid sessions only", sess.length, 2)
 check("id preserved", sess[0].id, "ses_abc123")
-check("title cleaned", sess[0].title, "A graph")
+check("title from stored when no opening", sess[0].title, "A graph")
 check("tokens parsed", sess[0].tokens, 5000)
 check("zero-token sessions dropped", sess.filter(x => x.id === "ses_zero").length, 0)
 check("bad id rejected", sess.filter(x => x.id === "notasession").length, 0)
 check("empty input", M.parseSessions(""), [])
 
-console.log("title cleaning")
-check("strips opener", M.cleanTitle("Okay, the user wants a widget"), "A widget")
-check("strips let us tackle", M.cleanTitle("Alright, let's tackle this. Build a plugin"), "Build a plugin")
-check("leaves clean titles", M.cleanTitle("Refactor the parser"), "Refactor the parser")
-check("empty becomes untitled", M.cleanTitle("   "), "(untitled)")
-check("null safe", M.cleanTitle(null), "(untitled)")
-check("length capped", M.cleanTitle("y".repeat(200)).length <= 72, true)
+console.log("title derivation")
+check("opening message wins over stored title",
+      M.cleanTitle("Add a graph to the widget", "Okay, the user wants something"), "Add a graph to the widget")
+check("falls back to stored title",
+      M.cleanTitle("", "Okay, the user wants a widget"), "A widget")
+check("strips let us tackle", M.cleanTitle("", "Alright, let's tackle this. Build a plugin"), "Build a plugin")
+check("strips a polite request opener", M.cleanTitle("Please add a sessions pane", ""), "Add a sessions pane")
+check("unwraps quotes", M.cleanTitle('"List every skill"', ""), "List every skill")
+check("takes the first sentence when short enough",
+      M.cleanTitle("Fix the parser. Then add tests and update the docs too.", ""), "Fix the parser")
+check("strips markdown", M.cleanTitle("Update `TokenModel.js` **now**", ""), "Update TokenModel.js now")
+check("first line only", M.cleanTitle("Add a pane\nand then do more", ""), "Add a pane")
+check("truncates on a word boundary",
+      M.cleanTitle("Build an omarchy theme using the omarchy-plugin-ship skills available here", ""),
+      "Build an omarchy theme using the omarchy-plugin-ship\u2026")
+check("empty becomes untitled", M.cleanTitle("   ", "  "), "(untitled)")
+check("null safe", M.cleanTitle(null, null), "(untitled)")
+check("length capped", M.cleanTitle("y".repeat(200), "").length <= 60, true)
 
 console.log("")
 if (fails) { console.log(`${fails} test(s) failed`); process.exit(1) }
