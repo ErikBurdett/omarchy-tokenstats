@@ -13,8 +13,12 @@ or a click away.
 - **Hover** — prompt tokens, generation rate, savings, RAM available, and which
   model is resident.
 - **Click** — the panel: totals for any window, a bar graph, a history table,
-  a per-model breakdown, and the savings arithmetic with its assumptions
-  printed next to it.
+  a sessions list, a per-model breakdown, and the savings arithmetic with its
+  assumptions printed next to it.
+- **Graph** — hover any bar for its exact date, time span and token count. The
+  axis carries real dates, and a rule marks each day boundary.
+- **Sessions** — your OpenCode sessions ranked by tokens generated. **Click one
+  to resume it** in a terminal, in its own working directory.
 - **By model** — how many tokens each model produced, its share of the window,
   and its measured throughput where one was sampled.
 - **Windows** — this hour (by minute), today (by hour), 7 days, 30 days,
@@ -145,11 +149,21 @@ to avoid.
 hardware actually spent generating them. It does not charge notional rent for
 memory or hardware you already own.
 
+## Live updates
+
+While the panel is open the poll drops to 2 seconds, so a running generation is
+reflected almost immediately; closing it returns to the configured interval. A
+counter read is a single loopback GET, so this costs essentially nothing.
+
+Verified: generating a 169-token completion moved the sampled figure from 113 to
+282 within about four seconds — exactly the count the API reported.
+
 ## Cost of running it
 
-One `curl` per refresh against loopback, plus two `FileView` reads. No log
-tailing, no repeated multi-megabyte parse, and nothing polls the upstream while
-no model is resident.
+One `curl` per refresh against loopback, plus two `FileView` reads. The session
+list is read only when its pane is opened. No log tailing, no repeated
+multi-megabyte parse, and nothing polls the upstream while no model is
+resident.
 
 ## History format versions
 

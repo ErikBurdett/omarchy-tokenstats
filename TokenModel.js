@@ -361,7 +361,8 @@ function series(history, period, now) {
       d = new Date(now.getTime() - i * 60000)
       key = minuteKey(d)
       b = history && history.minutes && history.minutes[key]
-      out.push({ label: pad(d.getMinutes()), tokens: b ? b.c : 0, key: key })
+      out.push({ label: pad(d.getMinutes()), tokens: b ? b.c : 0, key: key,
+                 at: d.getTime(), slot: "minute" })
     }
     return out
   }
@@ -371,7 +372,8 @@ function series(history, period, now) {
       d = new Date(now.getTime() - i * 3600000)
       key = hourKey(d)
       b = history && history.hours[key]
-      out.push({ label: pad(d.getHours()), tokens: b ? b.c : 0, key: key })
+      out.push({ label: pad(d.getHours()), tokens: b ? b.c : 0, key: key,
+                 at: d.getTime(), slot: "hour" })
     }
     return out
   }
@@ -385,7 +387,8 @@ function series(history, period, now) {
       for (key in (history ? history.days : {})) {
         if (key.indexOf(mk) === 0) acc += history.days[key].c
       }
-      out.push({ label: String(d.getMonth() + 1), tokens: acc, key: mk })
+      out.push({ label: MONTHS[d.getMonth()], tokens: acc, key: mk,
+                 at: d.getTime(), slot: "month" })
     }
     return out
   }
@@ -394,7 +397,8 @@ function series(history, period, now) {
     d = new Date(now.getTime() - i * 86400000)
     key = dayKey(d)
     b = history && history.days[key]
-    out.push({ label: pad(d.getDate()), tokens: b ? b.c : 0, key: key })
+    out.push({ label: pad(d.getDate()), tokens: b ? b.c : 0, key: key,
+               at: d.getTime(), slot: "day" })
   }
   return out
 }
@@ -623,4 +627,139 @@ function touched(history) {
     days: history.days,
     importedThrough: history.importedThrough
   }
+}
+
+
+// ---------------------------------------------------------------- labels
+
+var MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+              "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+var DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+
+// Axis text for one slot. Bare numbers ("15 17 19") read as nothing in
+// particular, so hours carry a colon and days carry their month.
+function axisLabel(point) {
+  if (!point) return ""
+  var d = new Date(point.at)
+  switch (point.slot) {
+    case "minute": return pad(d.getMinutes())
+    case "hour":   return pad(d.getHours()) + ":00"
+    case "month":  return MONTHS[d.getMonth()]
+    default:       return MONTHS[d.getMonth()] + " " + d.getDate()
+  }
+}
+
+// A day boundary is worth marking on an hour axis, otherwise "23:00 00:00"
+// looks like a continuous run rather than a new day.
+function isBoundary(point) {
+  if (!point) return false
+  var d = new Date(point.at)
+  if (point.slot === "hour") return d.getHours() === 0
+  if (point.slot === "minute") return d.getMinutes() === 0
+  if (point.slot === "day") return d.getDate() === 1
+  return false
+}
+
+// Full description of one slot, for the hover readout.
+function pointDetail(point) {
+  if (!point) return ""
+  var d = new Date(point.at)
+  var when
+  switch (point.slot) {
+    case "minute":
+      when = DAYS[d.getDay()] + " " + d.getDate() + " " + MONTHS[d.getMonth()] +
+             ", " + pad(d.getHours()) + ":" + pad(d.getMinutes())
+      break
+    case "hour":
+      when = DAYS[d.getDay()] + " " + d.getDate() + " " + MONTHS[d.getMonth()] +
+             ", " + pad(d.getHours()) + ":00-" + pad(d.getHours()) + ":59"
+      break
+    case "month":
+      when = MONTHS[d.getMonth()] + " " + d.getFullYear()
+      break
+    default:
+      when = DAYS[d.getDay()] + " " + d.getDate() + " " + MONTHS[d.getMonth()] +
+             " " + d.getFullYear()
+  }
+  return when + "  ·  " + formatTokens(point.tokens) + " tokens"
+}
+
+// The span a chart covers, so the reader knows what they are looking at
+// without hovering anything.
+function rangeLabel(points) {
+  if (!points || points.length === 0) return ""
+  var first = new Date(points[0].at)
+  var last = new Date(points[points.length - 1].at)
+  var slot = points[0].slot
+
+  if (slot === "minute" || slot === "hour") {
+    var sameDay = first.getDate() === last.getDate() && first.getMonth() === last.getMonth()
+    var head = MONTHS[first.getMonth()] + " " + first.getDate() + " " +
+               pad(first.getHours()) + ":" + pad(first.getMinutes())
+    var tail = (sameDay ? "" : MONTHS[last.getMonth()] + " " + last.getDate() + " ") +
+               pad(last.getHours()) + ":" + pad(last.getMinutes())
+    return head + " - " + tail
+  }
+  if (slot === "month") return MONTHS[first.getMonth()] + " " + first.getFullYear() +
+                               " - " + MONTHS[last.getMonth()] + " " + last.getFullYear()
+  return MONTHS[first.getMonth()] + " " + first.getDate() + " - " +
+         MONTHS[last.getMonth()] + " " + last.getDate()
+}
+
+// ---------------------------------------------------------------- sessions
+
+// One row per OpenCode session:
+//   id|title|generatedTokens|model|directory|updatedMs
+// Session ids are validated because they are handed to a launcher.
+function parseSessions(text) {
+  var raw = String(text === undefined || text === null ? "" : text)
+  if (raw.length === 0 || raw.length > MAX_STATE_BYTES) return []
+
+  var lines = raw.split("\n")
+  var limit = lines.length < 500 ? lines.length : 500
+  var out = []
+
+  for (var i = 0; i < limit; i++) {
+    var f = lines[i].split("|")
+    if (f.length < 6) continue
+    if (!/^ses_[A-Za-z0-9]{1,64}$/.test(f[0])) continue
+
+    var tokens = parseInt(f[2], 10)
+    var when = parseInt(f[5], 10)
+    if (!isNum(tokens) || tokens <= 0) continue
+
+    out.push({
+      id: f[0],
+      title: cleanTitle(f[1]),
+      tokens: clampNonNeg(tokens, Number.MAX_SAFE_INTEGER),
+      model: modelKey(f[3]),
+      directory: String(f[4] || "").substring(0, 240),
+      at: isNum(when) ? when : 0
+    })
+  }
+  return out
+}
+
+// Session titles are generated by whichever small model is configured, and a
+// tiny one tends to emit its own reasoning ("Okay, let's tackle this. The user
+// wants..."). Strip that opener and cap the length so the list stays readable.
+function cleanTitle(raw) {
+  var t = String(raw === undefined || raw === null ? "" : raw).trim()
+  t = t.replace(/^(Okay|OK|Alright|Sure|Well|Hmm)[,.!]?\s+/i, "")
+  t = t.replace(/^(so\s+)?let'?s\s+(tackle|see|think about)\s+this[.,]?\s*/i, "")
+  t = t.replace(/^the user (wants|is asking|asked)( to| for| about)?\s*/i, "")
+  t = t.replace(/\s+/g, " ").trim()
+  if (t.length === 0) return "(untitled)"
+  return t.charAt(0).toUpperCase() + t.substring(1, 72)
+}
+
+// Compact "when", for list rows: a time today, a day and month otherwise.
+function shortWhen(ms) {
+  if (!isNum(ms) || ms <= 0) return "—"
+  var d = new Date(ms)
+  var now = new Date()
+  var sameDay = d.getFullYear() === now.getFullYear() &&
+                d.getMonth() === now.getMonth() && d.getDate() === now.getDate()
+  if (sameDay) return pad(d.getHours()) + ":" + pad(d.getMinutes())
+  return MONTHS[d.getMonth()] + " " + d.getDate() + " " + pad(d.getHours()) + ":" + pad(d.getMinutes())
 }

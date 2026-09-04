@@ -28,6 +28,11 @@ Panel {
 
   property string period: "day"
   property string view: "graph"
+  property var sessions: []
+  // -1 when nothing is under the pointer.
+  property int hoverIndex: -1
+  readonly property var hoveredPoint: (hoverIndex >= 0 && hoverIndex < points.length)
+                                      ? points[hoverIndex] : null
 
   // Re-read while the panel is open. Evaluated once, this froze every total and
   // the graph at the moment the panel was first loaded.
@@ -135,8 +140,19 @@ Panel {
             foreground: root.barForeground
             fontFamily: root.fontFamily
             fontSize: Style.font.caption
-            tooltipText: "Every recorded slot with prompt and generated counts"
+            tooltipText: "Every recorded slot with its token count"
             onClicked: root.view = "history"
+          }
+
+          Button {
+            text: "Sessions"
+            selected: root.view === "sessions"
+            bordered: true
+            foreground: root.barForeground
+            fontFamily: root.fontFamily
+            fontSize: Style.font.caption
+            tooltipText: "OpenCode sessions by tokens generated. Click one to resume it."
+            onClicked: root.view = "sessions"
           }
         }
 
@@ -147,19 +163,20 @@ Panel {
           visible: root.view === "graph" && root.peak > 0
 
           Text {
-            width: parent.width / 2
+            width: parent.width * 0.62
+            elide: Text.ElideRight
             textFormat: Text.PlainText
-            text: "peak " + Model.formatTokens(root.peak) + root.slotUnit
+            text: Model.rangeLabel(root.points)
             color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
           }
 
           Text {
-            width: parent.width / 2
+            width: parent.width * 0.38
             horizontalAlignment: Text.AlignRight
             textFormat: Text.PlainText
-            text: Model.formatTokens(root.totals.c) + " total"
+            text: "peak " + Model.formatTokens(root.peak) + root.slotUnit
             color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
@@ -192,10 +209,25 @@ Panel {
               model: root.points
 
               Item {
+                id: slot
                 required property var modelData
                 required property int index
+                readonly property bool hovered: root.hoverIndex === index
+                readonly property bool boundary: Model.isBoundary(modelData)
                 width: (content.width - (root.points.length - 1)) / root.points.length
                 height: parent.height
+
+                // A faint rule where a new day starts, so "23:00 00:00" does
+                // not read as one continuous run.
+                Rectangle {
+                  visible: slot.boundary
+                  anchors.left: parent.left
+                  anchors.top: parent.top
+                  anchors.bottom: labelText.top
+                  width: 1
+                  color: root.dim
+                  opacity: 0.35
+                }
 
                 Rectangle {
                   anchors.bottom: labelText.top
@@ -209,7 +241,14 @@ Panel {
                     : 0
                   radius: Style.space(2)
                   color: modelData.tokens > 0 ? root.barForeground : "transparent"
-                  opacity: index === root.points.length - 1 ? 1 : 0.55
+                  opacity: slot.hovered ? 1 : (index === root.points.length - 1 ? 0.95 : 0.5)
+                }
+
+                MouseArea {
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  onEntered: root.hoverIndex = slot.index
+                  onExited: if (root.hoverIndex === slot.index) root.hoverIndex = -1
                 }
 
                 Text {
@@ -217,17 +256,33 @@ Panel {
                   anchors.bottom: parent.bottom
                   anchors.horizontalCenter: parent.horizontalCenter
                   textFormat: Text.PlainText
-                  // Thin the axis out rather than overprinting it when a window
-                  // has more slots than the panel has room for labels.
-                  text: (root.points.length <= 12 || index % Math.ceil(root.points.length / 12) === 0)
-                        ? modelData.label : ""
-                  color: root.dim
+                  // Thin the axis rather than overprinting it, and always keep
+                  // the slot under the pointer legible.
+                  text: (slot.hovered || root.points.length <= 8
+                         || index % Math.ceil(root.points.length / 8) === 0)
+                        ? Model.axisLabel(modelData) : ""
+                  color: slot.hovered ? root.barForeground : root.dim
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
                 }
               }
             }
           }
+        }
+
+        // Hover readout. Falls back to the window total so the line is never
+        // just empty space.
+        Text {
+          width: parent.width
+          visible: root.view === "graph"
+          elide: Text.ElideRight
+          textFormat: Text.PlainText
+          text: root.hoveredPoint
+                ? Model.pointDetail(root.hoveredPoint)
+                : Model.formatTokens(root.totals.c) + " tokens in this window  ·  hover a bar for detail"
+          color: root.hoveredPoint ? root.barForeground : root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
         }
 
         // ---- History table.
@@ -296,17 +351,111 @@ Panel {
           }
         }
 
+        // ---- Sessions. Click one to resume it in a terminal.
+        Item {
+          width: parent.width
+          height: Style.space(150)
+          visible: root.view === "sessions"
+
+          Text {
+            anchors.centerIn: parent
+            visible: root.sessions.length === 0
+            textFormat: Text.PlainText
+            text: "No OpenCode sessions with generated tokens yet"
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          Flickable {
+            anchors.fill: parent
+            contentWidth: width
+            contentHeight: sessionRows.implicitHeight
+            clip: true
+            boundsBehavior: Flickable.StopAtBounds
+            interactive: contentHeight > height
+
+            Column {
+              id: sessionRows
+              width: parent.width
+              spacing: Style.space(2)
+
+              Repeater {
+                model: root.sessions
+
+                Item {
+                  id: sessionRow
+                  required property var modelData
+                  width: sessionRows.width
+                  height: title.implicitHeight + meta.implicitHeight + Style.space(6)
+                  readonly property bool hovered: sessionMouse.containsMouse
+
+                  Rectangle {
+                    anchors.fill: parent
+                    color: sessionRow.hovered ? root.barForeground : "transparent"
+                    opacity: 0.10
+                    radius: Style.space(3)
+                  }
+
+                  Text {
+                    id: title
+                    anchors.top: parent.top
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    elide: Text.ElideRight
+                    // Titles are generated text from a model, so they are
+                    // rendered literally rather than as possible markup.
+                    textFormat: Text.PlainText
+                    text: sessionRow.modelData.title
+                    color: root.barForeground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.bodySmall
+                  }
+
+                  Text {
+                    id: meta
+                    anchors.top: title.bottom
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    elide: Text.ElideRight
+                    textFormat: Text.PlainText
+                    text: Model.formatTokens(sessionRow.modelData.tokens) + " tokens"
+                          + (sessionRow.modelData.model !== "" ? "  ·  " + sessionRow.modelData.model : "")
+                          + "  ·  " + Model.shortWhen(sessionRow.modelData.at)
+                          + (sessionRow.hovered ? "  ·  click to resume" : "")
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+
+                  MouseArea {
+                    id: sessionMouse
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: {
+                      if (root.hostWidget && root.hostWidget.openSession)
+                        root.hostWidget.openSession(sessionRow.modelData.id,
+                                                    sessionRow.modelData.directory)
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+
         PanelSeparator {
           width: parent.width
           foreground: root.barForeground
-          visible: root.byModel.length > 0
+          visible: root.byModel.length > 0 && root.view !== "sessions"
         }
 
         PanelSectionHeader {
           text: "By model"
           foreground: root.barForeground
           fontFamily: root.fontFamily
-          visible: root.byModel.length > 0
+          visible: root.byModel.length > 0 && root.view !== "sessions"
         }
 
         Repeater {
@@ -315,6 +464,7 @@ Panel {
           Row {
             required property var modelData
             width: content.width
+            visible: root.view !== "sessions"
 
             Text {
               width: parent.width * 0.34
@@ -364,12 +514,17 @@ Panel {
           }
         }
 
-        PanelSeparator { width: parent.width; foreground: root.barForeground }
+        PanelSeparator {
+          width: parent.width
+          foreground: root.barForeground
+          visible: root.view !== "sessions"
+        }
 
         PanelSectionHeader {
           text: "Versus a hosted API"
           foreground: root.barForeground
           fontFamily: root.fontFamily
+          visible: root.view !== "sessions"
         }
 
         Repeater {
@@ -385,6 +540,7 @@ Panel {
             required property var modelData
             required property int index
             width: content.width
+            visible: root.view !== "sessions"
 
             Text {
               width: parent.width * 0.55
@@ -413,6 +569,7 @@ Panel {
         Text {
           width: parent.width
           wrapMode: Text.WordWrap
+          visible: root.view !== "sessions"
           textFormat: Text.PlainText
           text: "Assumes " + root.currencySymbol + (root.rates.inputPerMillion || 0) + " / "
                 + root.currencySymbol + (root.rates.outputPerMillion || 0)

@@ -161,8 +161,11 @@ BarWidget {
     }
   }
 
+  // Poll hard while someone is looking at the panel and back off when they are
+  // not. A counter read is one loopback GET, so 2s costs nothing while open,
+  // and closing the panel returns to the configured interval.
   Timer {
-    interval: root.refreshSec * 1000
+    interval: root.opened ? Math.min(root.refreshSec, 2) * 1000 : root.refreshSec * 1000
     running: true
     repeat: true
     onTriggered: root.refresh()
@@ -173,6 +176,8 @@ BarWidget {
     pollProc.running = false
     importWatchdog.stop()
     importProc.running = false
+    sessionsWatchdog.stop()
+    sessionsProc.running = false
     if (root.historyDirty) root.saveHistory()
   }
 
@@ -290,6 +295,66 @@ BarWidget {
     onTriggered: importProc.running = false
   }
 
+  // ---------------------------------------------------------------- sessions
+
+  // OpenCode's own session records. Read on demand rather than on a timer:
+  // nothing needs them until the pane is open.
+  property var sessions: []
+
+  function loadSessions() {
+    if (!importOpencode || sessionsProc.running) return
+    sessionsProc.command = [
+      "/usr/bin/sqlite3", "-readonly", "-noheader", "-separator", "|",
+      "file:" + root.opencodeDb + "?mode=ro",
+      "select id," +
+      " replace(replace(coalesce(title,''),'|',' '),char(10),' ')," +
+      " coalesce(tokens_output,0) + coalesce(tokens_reasoning,0)," +
+      " coalesce(json_extract(model,'$.id'),'')," +
+      " replace(coalesce(directory,''),'|',' ')," +
+      " coalesce(time_updated,0)" +
+      " from session" +
+      " where coalesce(tokens_output,0) > 0" +
+      " order by time_updated desc limit 60;"
+    ]
+    sessionsWatchdog.restart()
+    sessionsProc.running = true
+  }
+
+  Process {
+    id: sessionsProc
+    running: false
+    environment: ({})
+    stdout: StdioCollector { id: sessionsOut; waitForEnd: true }
+    onExited: {
+      sessionsWatchdog.stop()
+      root.sessions = Model.parseSessions(sessionsOut.text)
+    }
+  }
+
+  Timer {
+    id: sessionsWatchdog
+    interval: 10000
+    onTriggered: sessionsProc.running = false
+  }
+
+  // Resume a session in a terminal. No shell: the id is pattern-validated, the
+  // directory becomes the process working directory rather than part of a
+  // command string, and every executable is an absolute path.
+  function openSession(id, directory) {
+    if (!/^ses_[A-Za-z0-9]{1,64}$/.test(String(id))) return
+    launchProc.workingDirectory = String(directory || Quickshell.env("HOME"))
+    launchProc.command = ["/usr/bin/omarchy-launch-tui", "--app-id=org.omarchy.agent",
+                          Quickshell.env("HOME") + "/.local/share/mise/shims/opencode",
+                          "--session", String(id)]
+    launchProc.running = true
+    root.close()
+  }
+
+  Process {
+    id: launchProc
+    running: false
+  }
+
   // ---------------------------------------------------------------- panel
 
   readonly property bool opened: panelLoader.item ? panelLoader.item.opened === true : false
@@ -312,6 +377,7 @@ BarWidget {
     if ("loadedModel" in target) target.loadedModel = root.loadedModel
     if ("rates" in target) target.rates = root.rates
     if ("currencySymbol" in target) target.currencySymbol = root.currencySymbol
+    if ("sessions" in target) target.sessions = root.sessions
   }
 
   onBarChanged: injectPanel()
@@ -319,6 +385,10 @@ BarWidget {
   onHistoryChanged: injectPanel()
   onMemInfoChanged: injectPanel()
   onLoadedModelChanged: injectPanel()
+  onSessionsChanged: injectPanel()
+  // Refresh the session list whenever the panel is opened, so it is current
+  // without polling the database in the background.
+  onOpenedChanged: if (root.opened) root.loadSessions()
 
   Loader {
     id: panelLoader

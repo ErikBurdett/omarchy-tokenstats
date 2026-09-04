@@ -11,7 +11,8 @@ new Function("exports", src + `;Object.assign(exports,{
   parseHistory, record, prune, totals, series, savings, formatTokens,
   formatRate, formatMoney, periodLabel, periodKey, parseMeminfo, formatSize,
   minuteKey, touched, tokensPerHour, parseOpencodeRows, applyImport, elapsedHours,
-  modelKey, modelBreakdown });`)(M)
+  modelKey, modelBreakdown, axisLabel, pointDetail, rangeLabel, isBoundary,
+  parseSessions, cleanTitle, shortWhen });`)(M)
 
 let fails = 0
 const check = (name, actual, expected) => {
@@ -215,6 +216,46 @@ check("oversized", M.parseMeminfo("x".repeat(70000)), null)
 check("size GiB", M.formatSize(2097152), "2.0 GiB")
 check("size MiB", M.formatSize(51200), "50 MiB")
 check("size invalid", M.formatSize(-1), "—")
+
+console.log("graph labels")
+const gnow = new Date(2026, 8, 4, 13, 30)
+const dayPts = M.series(M.emptyHistory(), "day", gnow)
+check("hour axis carries a colon", M.axisLabel(dayPts[0]), "14:00")
+check("hour slots span a day", dayPts.length, 24)
+check("range names both ends", M.rangeLabel(dayPts), "Sep 3 14:30 - Sep 4 13:30")
+check("midnight is a boundary", M.isBoundary({ at: new Date(2026, 8, 4, 0, 0).getTime(), slot: "hour" }), true)
+check("noon is not", M.isBoundary({ at: new Date(2026, 8, 4, 12, 0).getTime(), slot: "hour" }), false)
+check("hour detail names the day", M.pointDetail({ at: new Date(2026, 8, 4, 3, 0).getTime(), slot: "hour", tokens: 64000 }),
+      "Fri 4 Sep, 03:00-03:59  ·  64k tokens")
+check("day detail", M.pointDetail({ at: new Date(2026, 8, 4).getTime(), slot: "day", tokens: 1200 }),
+      "Fri 4 Sep 2026  ·  1.2k tokens")
+check("month axis", M.axisLabel({ at: new Date(2026, 8, 1).getTime(), slot: "month" }), "Sep")
+check("week range", M.rangeLabel(M.series(M.emptyHistory(), "week", gnow)), "Aug 29 - Sep 4")
+check("empty series", M.rangeLabel([]), "")
+
+console.log("sessions")
+const SROWS = [
+  "ses_abc123|Okay, let's tackle this. The user wants a graph|5000|coder|/home/x|1788542714700",
+  "ses_def456|Plain title|10|reason|/home/y|1788542714800",
+  "notasession|x|5|m|/d|1",
+  "ses_zero|no tokens|0|m|/d|1"
+].join("\n")
+const sess = M.parseSessions(SROWS)
+check("valid sessions only", sess.length, 2)
+check("id preserved", sess[0].id, "ses_abc123")
+check("title cleaned", sess[0].title, "A graph")
+check("tokens parsed", sess[0].tokens, 5000)
+check("zero-token sessions dropped", sess.filter(x => x.id === "ses_zero").length, 0)
+check("bad id rejected", sess.filter(x => x.id === "notasession").length, 0)
+check("empty input", M.parseSessions(""), [])
+
+console.log("title cleaning")
+check("strips opener", M.cleanTitle("Okay, the user wants a widget"), "A widget")
+check("strips let us tackle", M.cleanTitle("Alright, let's tackle this. Build a plugin"), "Build a plugin")
+check("leaves clean titles", M.cleanTitle("Refactor the parser"), "Refactor the parser")
+check("empty becomes untitled", M.cleanTitle("   "), "(untitled)")
+check("null safe", M.cleanTitle(null), "(untitled)")
+check("length capped", M.cleanTitle("y".repeat(200)).length <= 72, true)
 
 console.log("")
 if (fails) { console.log(`${fails} test(s) failed`); process.exit(1) }
