@@ -6,6 +6,16 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **The plugin now works with no configuration.** OpenCode's records were
+  already an exact source; they are now a live one when llama.cpp's counters
+  are unavailable, rather than only a one-shot backfill at startup. Enabling
+  `--metrics` remains worthwhile — it adds live throughput and covers clients
+  other than OpenCode — but is no longer required for the plugin to function.
+- The panel and tooltip name which source the numbers come from, and say what
+  enabling metrics would add.
+
 ## [1.0.0] — 2026-09-04
 
 First release.

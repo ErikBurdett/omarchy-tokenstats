@@ -60,6 +60,11 @@ BarWidget {
   property string loadedModel: ""
   property var memInfo: null
   property bool historyLoaded: false
+  // True once llama.cpp's counters have answered at least once. They are off by
+  // default, so a fresh install starts false and runs on OpenCode's records
+  // instead — the plugin is useful before anything is configured.
+  property bool metricsAvailable: false
+  property bool opencodeSeen: false
   property bool historyDirty: false
   // Which request is in flight, so the reply is parsed as what we asked for.
   property string pendingKind: ""
@@ -96,6 +101,7 @@ BarWidget {
     var parsed = Model.parseMetrics(text)
     if (!parsed) { loadedModel = ""; return }
     parsed.model = loadedModel
+    root.metricsAvailable = true
 
     // A successful read means live accounting covers up to now, so the importer
     // never has to reach back over a period we already counted.
@@ -262,6 +268,9 @@ BarWidget {
 
   function importOpencodeHistory() {
     if (!importOpencode || !historyLoaded || importProc.running) return
+    // Nothing to import while live counters are covering the same period: the
+    // watermark has already advanced past every row OpenCode could offer.
+    if (root.metricsAvailable && root.history.importedThrough >= Date.now() - 1000) return
 
     var since = Math.round(Number(root.history.importedThrough) || 0)
     if (!isFinite(since) || since < 0) since = 0
@@ -294,6 +303,7 @@ BarWidget {
       var rows = Model.parseOpencodeRows(importOut.text,
                                          Number(root.history.importedThrough) || 0,
                                          root.importBoundary)
+      if (rows.length > 0) root.opencodeSeen = true
       if (rows.length > 0) {
         Model.applyImport(root.history, rows)
         root.history.importedThrough = root.importBoundary
@@ -308,6 +318,18 @@ BarWidget {
     id: importWatchdog
     interval: 15000
     onTriggered: importProc.running = false
+  }
+
+  // With llama.cpp's counters enabled this never runs: the import is a
+  // one-shot gap filler at startup. Without them it becomes the live source,
+  // so a standard install still counts tokens — exactly, because OpenCode
+  // records the provider's own usage block. The watermark makes the two
+  // mutually exclusive, so nothing is ever counted twice.
+  Timer {
+    interval: root.opened ? 5000 : 30000
+    running: !root.metricsAvailable
+    repeat: true
+    onTriggered: root.importOpencodeHistory()
   }
 
   // ---------------------------------------------------------------- sessions
@@ -411,6 +433,8 @@ BarWidget {
     if ("rates" in target) target.rates = root.rates
     if ("currencySymbol" in target) target.currencySymbol = root.currencySymbol
     if ("sessions" in target) target.sessions = root.sessions
+    if ("sourceState" in target) target.sourceState = root.sourceState
+    if ("sourceLine" in target) target.sourceLine = root.sourceLine
   }
 
   onBarChanged: injectPanel()
@@ -419,6 +443,7 @@ BarWidget {
   onMemInfoChanged: injectPanel()
   onLoadedModelChanged: injectPanel()
   onSessionsChanged: injectPanel()
+  onSourceStateChanged: injectPanel()
   // Refresh the session list whenever the panel is opened, so it is current
   // without polling the database in the background.
   onOpenedChanged: if (root.opened) root.loadSessions()
@@ -447,6 +472,25 @@ BarWidget {
 
   // ---------------------------------------------------------------- bar
 
+  // Which source the numbers are coming from, in the user's terms.
+  readonly property string sourceState: {
+    if (metricsAvailable) return "live"
+    if (opencodeSeen || totalsAll.c > 0) return "opencode"
+    return "none"
+  }
+  readonly property var totalsAll: Model.totals(history, "all", new Date())
+
+  readonly property string sourceLine: {
+    switch (sourceState) {
+      case "live":
+        return "Counting live from llama.cpp"
+      case "opencode":
+        return "Counting from OpenCode's records. Enable llama.cpp metrics for live throughput and non-OpenCode clients."
+      default:
+        return "No token source yet. Run a local model through OpenCode, or enable llama.cpp metrics."
+    }
+  }
+
   readonly property string tooltip: {
     var t = root.periodTotals
     var lines = [Model.periodLabel(root.barPeriod) + ": " + Model.formatTokens(root.perHour) + " tokens/hour"]
@@ -459,6 +503,7 @@ BarWidget {
     if (root.memInfo)
       lines.push("Memory available: " + Model.formatSize(root.memInfo.available))
     lines.push(root.loadedModel !== "" ? "Model loaded: " + root.loadedModel : "No model resident")
+    lines.push(root.sourceLine)
     lines.push("Click for the graph and history")
     return lines.join("\n")
   }

@@ -30,6 +30,8 @@ Panel {
   property string loadedModel: ""
   property var rates: ({})
   property string currencySymbol: "$"
+  property string sourceState: "none"
+  property string sourceLine: ""
 
   property string period: "day"
   property string view: "graph"
@@ -635,6 +637,19 @@ Panel {
           text: (root.loadedModel !== "" ? "Model: " + root.loadedModel : "No model resident")
                 + (root.memInfo ? "   ·   " + Model.formatSize(root.memInfo.available) + " RAM available" : "")
           color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+        }
+
+        // Where the numbers come from. Worth a permanent line rather than a
+        // one-off warning: which source is active changes what the throughput
+        // figure can mean, and the setup hint is only useful where it is seen.
+        Text {
+          width: parent.width
+          wrapMode: Text.WordWrap
+          textFormat: Text.PlainText
+          text: root.sourceLine
+          color: root.sourceState === "none" ? (root.bar ? root.bar.urgent : Color.urgent) : root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
         }

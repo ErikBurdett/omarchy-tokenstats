@@ -21,6 +21,8 @@ or a click away.
 - **Sessions** — your OpenCode sessions ranked by tokens generated, titled from
   what you actually asked for. **Click one to resume it** in a terminal, in its
   own working directory.
+- **Honest about its source** — the panel names where the numbers come from, and
+  what enabling llama.cpp metrics would add.
 - **By model** — how many tokens each model produced, its share of the window,
   and its measured throughput where one was sampled.
 - **Windows** — this hour (by minute), today (by hour), 7 days, 30 days,
@@ -41,8 +43,17 @@ bytes-per-token constant anywhere in this plugin.
 
 ## Requirements
 
-- Omarchy 4 (Quattro) with `omarchy-shell`
-- `llama-swap` on loopback, with llama.cpp's metrics endpoint enabled
+Omarchy 4 (Quattro) with `omarchy-shell`, and a local model you actually run.
+
+**It works with no configuration.** OpenCode records the provider's own usage
+block for every reply, so the plugin counts exactly from those records out of
+the box — no setup, no flags, nothing to enable.
+
+### Optional: live counting from llama.cpp
+
+Enabling llama.cpp's metrics endpoint adds two things: **live throughput**
+(tokens per second, which OpenCode's records cannot provide) and coverage of
+**clients other than OpenCode**.
 
 Add `--metrics` to your llama-server arguments. In a llama-swap `config.yaml`
 that uses a shared macro:
@@ -56,8 +67,11 @@ macros:
     --metrics
 ```
 
-Then `systemctl --user restart llama-swap`. Without it the upstream returns
-501 and the widget simply reads zero.
+Then `systemctl --user restart llama-swap`.
+
+The panel always says which source it is using, so you never have to guess
+whether this step took effect. The two sources are mutually exclusive by
+watermark — nothing is ever counted twice.
 
 ### External dependencies
 
