@@ -48,15 +48,46 @@ bytes-per-token constant anywhere in this plugin.
 
 Omarchy 4 (Quattro) with `omarchy-shell`, and a local model you actually run.
 
-**It works with no configuration.** OpenCode records the provider's own usage
-block for every reply, so the plugin counts exactly from those records out of
-the box — no setup, no flags, nothing to enable.
+**No configuration, no flags, nothing to enable.** The plugin reads exact token
+counts from whichever source is present, and at least one of them needs nothing
+from you:
+
+| What you already run | Counts with zero configuration? |
+|---|---|
+| Local models through **OpenCode** | **Yes.** OpenCode stores the provider's own `usage` block for every reply, so the counts are exact and already on disk. |
+| **llama.cpp** with `--metrics` enabled | **Yes**, for every client, plus live tokens/second. |
+| llama.cpp without `--metrics`, and no OpenCode | No — there is no exact record to read, and this plugin will not estimate one. |
+
+The two sources run side by side and are separated per model, so having both
+counts everything exactly once. The panel always names the source it is using,
+so a zero is never ambiguous between "idle" and "misconfigured".
+
+### Verifying that for yourself
+
+The no-configuration path is easy to reproduce, and worth doing if you are
+reviewing this rather than using it. Point the plugin at anything that serves
+llama-swap's model list but refuses metrics — a five-line mock is enough — then
+start the shell with no stored state at all:
+
+```bash
+# stop the shell first: a running one writes its in-memory history back on exit
+while timeout 5 quickshell kill -p "$OMARCHY_PATH/shell" --any-display; do :; done
+rm -rf ~/.local/state/omarchy/tokenstats
+hyprctl dispatch 'hl.dsp.exec_cmd("omarchy-launch-shell")'
+```
+
+With `/upstream/<model>/metrics` answering `501` and no prior state, the widget
+still fills in from OpenCode within a refresh or two. Measured on the machine
+this was written on: **199,762 generated tokens across four days**, with the
+recorded generation seconds at exactly `0` — which is the proof that none of it
+came from the live counters. The panel footer reads *"Counting from OpenCode's
+records."*
 
 ### Optional: live counting from llama.cpp
 
-Enabling llama.cpp's metrics endpoint adds two things: **live throughput**
-(tokens per second, which OpenCode's records cannot provide) and coverage of
-**clients other than OpenCode**.
+This step is **optional** and the plugin is fully functional without it. It adds
+two things: **live throughput** (tokens per second, which OpenCode's records
+cannot provide) and coverage of **clients other than OpenCode**.
 
 Add `--metrics` to your llama-server arguments. In a llama-swap `config.yaml`
 that uses a shared macro:

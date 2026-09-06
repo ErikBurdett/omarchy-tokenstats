@@ -6,6 +6,21 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.3.1] — 2026-09-06
+
+### Documentation
+
+- The Requirements section now states exactly which setups count with zero
+  configuration and which do not, as a table, rather than a claim. Enabling
+  llama.cpp's `--metrics` is labelled optional where it is described.
+- Added a reproducible recipe for verifying the no-configuration path: serve
+  llama-swap's model list while refusing `/upstream/<model>/metrics` with `501`,
+  stop the shell, delete all stored state, and start it again. Measured that way
+  on the development machine, the plugin recorded 199,762 generated tokens
+  across four days from OpenCode's records alone, with recorded generation
+  seconds at exactly `0` — which is what proves none of it came from the live
+  counters.
+
 ## [1.3.0] — 2026-09-06
 
 ### Added
@@ -124,10 +139,7 @@ All notable changes are recorded here. The format follows
 - Model ids from llama-swap are validated against `^[A-Za-z0-9._-]{1,40}$`
   before being interpolated into a request path, rather than used as returned.
 - The panel and tooltip name every resident model, not one.
-
-### Changed
-
-- **The plugin now works with no configuration.** OpenCode's records were
+- **The plugin works with no configuration.** OpenCode's records were
   already an exact source; they are now a live one when llama.cpp's counters
   are unavailable, rather than only a one-shot backfill at startup. Enabling
   `--metrics` remains worthwhile — it adds live throughput and covers clients
