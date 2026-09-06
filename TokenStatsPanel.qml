@@ -651,7 +651,16 @@ Panel {
                     text: String(root.settingValue(rateRow.modelData.key))
                     // Committed on Enter or on leaving the field, never on every
                     // keystroke — a half-typed "3." is not a price.
-                    onEditingFinished: root.writeSetting(rateRow.modelData.key, text)
+                    onEditingFinished: {
+                      root.writeSetting(rateRow.modelData.key, text)
+                      // Typing has already broken the binding above, and a value
+                      // the model refused was never stored. Restore the binding
+                      // so the field shows what is actually in force instead of
+                      // leaving a rejected string on screen looking accepted.
+                      text = Qt.binding(function() {
+                        return String(root.settingValue(rateRow.modelData.key))
+                      })
+                    }
                   }
                 }
               }
@@ -676,7 +685,10 @@ Panel {
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.bodySmall
                   text: String(root.settingValue("currencySymbol"))
-                  onEditingFinished: root.writeSetting("currencySymbol", text)
+                  onEditingFinished: {
+                    root.writeSetting("currencySymbol", text)
+                    text = Qt.binding(function() { return String(root.settingValue("currencySymbol")) })
+                  }
                 }
               }
 
