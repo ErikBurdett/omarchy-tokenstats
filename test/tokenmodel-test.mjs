@@ -13,7 +13,9 @@ new Function("exports", src + `;Object.assign(exports,{
   minuteKey, touched, tokensPerHour, parseOpencodeRows, applyImport, elapsedHours,
   modelKey, modelBreakdown, axisLabel, pointDetail, rangeLabel, isBoundary,
   parseSessions, cleanTitle, shortWhen,
-  coverageFloor, markCovered, coveredFor, reconcileImport, cacheHitPercent });`)(M)
+  coverageFloor, markCovered, coveredFor, reconcileImport, cacheHitPercent,
+  parseSettings, applySetting, coerceSetting, isSettingKey, periodSettingLabel,
+  settingDefault, SETTING_DEFAULTS, SETTING_SPECS });`)(M)
 
 let fails = 0
 const check = (name, actual, expected) => {
@@ -298,6 +300,69 @@ const crow = M.parseOpencodeRows("1788542714634|20|5|0|coder|880", 0, Number.MAX
 check("import reads cache.read + cache.write", crow.promptCached, 880)
 check("import without a cache column is zero",
       M.parseOpencodeRows("1788542714634|20|5|0|coder", 0, Number.MAX_SAFE_INTEGER)[0].promptCached, 0)
+
+console.log("panel-set settings")
+// These are written by the Setup pane into a file this plugin owns. shell.json
+// is never touched. Every value is re-coerced on the way in and on the way out,
+// because a stored file is attacker-controlled in the same threat model as any
+// other local state.
+check("known key", M.isSettingKey("systemWatts"), true)
+check("endpoint is deliberately NOT settable from the panel",
+      M.isSettingKey("endpoint"), false)
+check("enum value accepted", M.coerceSetting("barPeriod", "7 days"), "7 days")
+check("enum value outside the manifest list rejected",
+      M.coerceSetting("barPeriod", "Yesterday"), undefined)
+check("money accepted", M.coerceSetting("cloudInputPerMillion", "3.50"), "3.50")
+check("money that is not a number rejected",
+      M.coerceSetting("cloudInputPerMillion", "3; rm -rf /"), undefined)
+check("money out of range rejected",
+      M.coerceSetting("cloudInputPerMillion", "99999"), undefined)
+check("integer clamped to its range", M.coerceSetting("systemWatts", 99999), 2000)
+check("currency truncated", M.coerceSetting("currencySymbol", "EUROS"), "EUR")
+check("bool", M.coerceSetting("importOpencode", false), false)
+
+check("unknown keys dropped on load",
+      M.parseSettings('{"systemWatts":250,"endpoint":"http://elsewhere","nope":1}'),
+      { systemWatts: 250 })
+check("garbage load is empty, not a throw", M.parseSettings("{{{"), {})
+check("oversized load is empty", M.parseSettings("x".repeat(5000000)), {})
+
+let ov = M.applySetting({}, "systemWatts", 300)
+check("applySetting stores", ov.systemWatts, 300)
+check("applySetting returns a NEW object so bindings notice",
+      M.applySetting(ov, "systemWatts", 301) === ov, false)
+check("null clears the override back to shell.json",
+      M.applySetting(ov, "systemWatts", null).systemWatts, undefined)
+check("a key outside the allow-list cannot be introduced",
+      M.applySetting({}, "endpoint", "http://elsewhere").endpoint, undefined)
+check("an invalid value leaves the override unset",
+      M.applySetting({}, "cloudInputPerMillion", "abc").cloudInputPerMillion, undefined)
+
+// The pane stores the manifest's own enum label, so a value set in the panel
+// and one set in Setup > Plugins are the same string and round-trip.
+check("period label round trip", M.periodKey(M.periodSettingLabel("week")), "week")
+check("unknown period falls back", M.periodSettingLabel("nonsense"), "Today")
+
+// The Setup pane falls back to these when neither it nor shell.json has a
+// value, while a fresh install gets manifest.json's `defaults`. If the two ever
+// disagreed, the pane would show one number and the widget would use another —
+// silently, and only for users who had never touched the setting.
+const manifest = JSON.parse(fs.readFileSync(path.join(here, "..", "manifest.json"), "utf8"))
+const manifestDefaults = manifest.barWidget.defaults
+for (const key of Object.keys(M.SETTING_DEFAULTS)) {
+  check(`manifest default matches the model for ${key}`,
+        String(manifestDefaults[key]), String(M.SETTING_DEFAULTS[key]))
+}
+// And every settable key must actually exist in the manifest schema, or the
+// pane would be writing something Setup > Plugins can never show or clear.
+const schemaKeys = manifest.barWidget.schema.map(e => e.key)
+for (const key of Object.keys(M.SETTING_SPECS)) {
+  check(`manifest schema declares ${key}`, schemaKeys.includes(key), true)
+}
+// The enum the pane offers must be exactly the enum the manifest declares.
+const barPeriodOptions = manifest.barWidget.schema.find(e => e.key === "barPeriod").options
+check("barPeriod options match the manifest",
+      M.SETTING_SPECS.barPeriod.options, barPeriodOptions)
 
 console.log("tokens per hour")
 let rh = M.emptyHistory()

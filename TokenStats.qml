@@ -23,9 +23,43 @@ BarWidget {
   id: root
   moduleName: "io.github.erikburdett.tokenstats"
 
-  // ---- Settings. Clamped or allow-listed here: shell.json is editable by
-  //      anything running as the user, so nothing goes to a Timer, a formatter
-  //      or a price unchecked.
+  // ---- Settings.
+  //
+  // Two layers. shell.json (Setup > Plugins) is the base, and the panel's own
+  // Setup pane writes OVERRIDES to a state file this plugin owns. The plugin
+  // never writes shell.json — that is the user's bar layout, and rewriting user
+  // configuration from a widget is exactly what the marketplace checklist asks
+  // about. Omarchy's own weather panel persists to a state file the same way.
+  //
+  // Both layers are clamped or allow-listed below: each is a file editable by
+  // anything running as the user, so nothing reaches a Timer, a formatter or a
+  // price unchecked.
+  property var overrides: ({})
+
+  // Shadows BarWidget.setting(). Reading `root.overrides` here is what makes
+  // every binding below depend on it, so a change in the Setup pane repaints
+  // the bar immediately instead of waiting for a restart.
+  function setting(name, fallback) {
+    var over = root.overrides
+    if (over && over[name] !== undefined && over[name] !== null) return over[name]
+    var value = settings ? settings[name] : undefined
+    return value === undefined || value === null ? fallback : value
+  }
+
+  // Called from the Setup pane. `value === null` clears the override and lets
+  // shell.json decide again. Model.applySetting re-coerces against its
+  // allow-list, so a wrong key or a wrong type cannot get in from here either.
+  function setOverride(key, value) {
+    root.overrides = Model.applySetting(root.overrides, key, value)
+    overridesFile.setText(JSON.stringify(root.overrides))
+  }
+
+  function resetOverrides() {
+    root.overrides = ({})
+    overridesFile.setText("{}")
+  }
+
+  readonly property string overridesPath: stateDir + "/settings.json"
   readonly property int refreshSec: Math.min(Math.max(Math.round(setting("refreshIntervalSec", 10)), 2), 120)
   readonly property string barPeriod: {
     var allowed = ["hour", "day", "week", "month", "year", "all"]
@@ -278,6 +312,7 @@ BarWidget {
     // A fresh install has no state directory, and FileView will not create one,
     // so the first write would fail silently and history would never persist.
     mkdirProc.running = true
+    overridesFile.reload()
     historyFile.reload()
     refresh()
   }
@@ -417,6 +452,20 @@ BarWidget {
       root.historyLoaded = true
       root.importOpencodeHistory()
     }
+  }
+
+  // watchChanges so every bar surface — one per monitor — picks up a change made
+  // in any one of their panels, rather than the others sitting stale until a
+  // restart. atomicWrites for the same reason history.json uses it.
+  FileView {
+    id: overridesFile
+    path: root.overridesPath
+    printErrors: false
+    atomicWrites: true
+    watchChanges: true
+    onFileChanged: reload()
+    onLoaded: root.overrides = Model.parseSettings(text())
+    onLoadFailed: root.overrides = ({})
   }
 
   function saveHistory() {
@@ -674,6 +723,11 @@ BarWidget {
   function open() { if (panelLoader.item) panelLoader.item.open() }
   function close() { if (panelLoader.item) panelLoader.item.close() }
   function togglePanel() { if (panelLoader.item) panelLoader.item.toggle() }
+  function openSetup() {
+    if (!panelLoader.item) return
+    if (typeof panelLoader.item.showSetup === "function") panelLoader.item.showSetup()
+    panelLoader.item.open()
+  }
   function closeForPopoutSwitch() { if (panelLoader.item) panelLoader.item.closeForPopoutSwitch() }
 
   function injectPanel() {
@@ -691,6 +745,8 @@ BarWidget {
     if ("sessions" in target) target.sessions = root.sessions
     if ("sourceState" in target) target.sourceState = root.sourceState
     if ("sourceLine" in target) target.sourceLine = root.sourceLine
+    if ("overrides" in target) target.overrides = root.overrides
+    if ("shellSettings" in target) target.shellSettings = root.settings
   }
 
   onBarChanged: injectPanel()
@@ -700,6 +756,7 @@ BarWidget {
   onLoadedModelChanged: injectPanel()
   onSessionsChanged: injectPanel()
   onSourceStateChanged: injectPanel()
+  onOverridesChanged: injectPanel()
   // Refresh the session list whenever the panel is opened, so it is current
   // without polling the database in the background.
   onOpenedChanged: if (root.opened) root.loadSessions()
@@ -719,6 +776,10 @@ BarWidget {
     target: "io.github.erikburdett.tokenstats"
 
     function refresh(): void { root.broadcast("refresh") }
+    // Named `edit` to match Omarchy's own convention — `omarchy-shell
+    // omarchy.weather edit` opens that widget on its configuration, so this
+    // does the same and can be bound to a key or driven from a menu.
+    function edit(): void { root.openSetup() }
     function open(): void { root.open() }
     function close(): void { root.close() }
     function show(): void { root.open() }

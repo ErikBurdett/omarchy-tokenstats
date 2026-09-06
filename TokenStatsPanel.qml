@@ -33,6 +33,42 @@ Panel {
   property string sourceState: "none"
   property string sourceLine: ""
 
+  // Panel-set overrides and the shell.json values beneath them, both injected
+  // by the widget. The pane shows the effective value and says where it came
+  // from, so "why is this number not what I set" is answerable on screen.
+  property var overrides: ({})
+  property var shellSettings: ({})
+
+  // Everything that is a statistic rather than a list or a form. Sessions and
+  // Setup replace the whole body; the graph, table, per-model rows and cost
+  // block all belong to the same "show me the numbers" mode.
+  readonly property bool statsView: view !== "sessions" && view !== "setup"
+
+  // Effective value for a setting: panel override, else shell.json, else the
+  // built-in default. Mirrors the widget's own setting() resolution.
+  // Panel override, else shell.json, else the built-in default. The default
+  // comes from the model rather than being retyped here, because the manifest
+  // declares the same values and a test asserts the two agree.
+  function settingValue(key) {
+    if (overrides && overrides[key] !== undefined && overrides[key] !== null) return overrides[key]
+    if (shellSettings && shellSettings[key] !== undefined && shellSettings[key] !== null) return shellSettings[key]
+    return Model.settingDefault(key)
+  }
+
+  function settingSource(key) {
+    if (overrides && overrides[key] !== undefined && overrides[key] !== null) return "set here"
+    if (shellSettings && shellSettings[key] !== undefined && shellSettings[key] !== null) return "from Setup > Plugins"
+    return "default"
+  }
+
+  function showSetup() {
+    view = "setup"
+  }
+
+  function writeSetting(key, value) {
+    if (hostWidget && typeof hostWidget.setOverride === "function") hostWidget.setOverride(key, value)
+  }
+
   property string period: "day"
   property string view: "graph"
   property var sessions: []
@@ -163,6 +199,17 @@ Panel {
             fontSize: Style.font.caption
             tooltipText: "OpenCode sessions by tokens generated. Click one to resume it."
             onClicked: root.view = "sessions"
+          }
+
+          Button {
+            text: "Setup"
+            selected: root.view === "setup"
+            bordered: true
+            foreground: root.barForeground
+            fontFamily: root.fontFamily
+            fontSize: Style.font.caption
+            tooltipText: "Change what the bar shows and the rates the comparison assumes"
+            onClicked: root.view = "setup"
           }
         }
 
@@ -492,17 +539,230 @@ Panel {
           }
         }
 
+        // ---- Setup. Everything tunable, edited here rather than only in
+        //      shell.json, because the rates below are assumptions you want to
+        //      change while looking at the number they produced.
+        //
+        //      Writes go to this plugin's own state file. shell.json is never
+        //      touched: it holds the user's bar layout, and a widget that
+        //      rewrites user configuration is a marketplace blocker. Clearing
+        //      a field with Reset hands the setting back to Setup > Plugins.
+        Item {
+          width: parent.width
+          height: Style.space(330)
+          visible: root.view === "setup"
+
+          Flickable {
+            anchors.fill: parent
+            contentWidth: width
+            contentHeight: setupColumn.implicitHeight
+            clip: true
+            boundsBehavior: Flickable.StopAtBounds
+            interactive: contentHeight > height
+
+            Column {
+              id: setupColumn
+              width: parent.width
+              spacing: Style.space(8)
+
+              Text {
+                width: parent.width
+                wrapMode: Text.WordWrap
+                textFormat: Text.PlainText
+                text: "Changes apply immediately and are saved to this plugin's own state file. "
+                      + "Your shell.json is never modified."
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+
+              // ---- What the bar itself shows.
+              Text {
+                textFormat: Text.PlainText
+                text: "BAR SHOWS  ·  " + root.settingSource("barPeriod")
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+
+              ButtonGroup {
+                width: parent.width
+                options: ["Hour", "Day", "Week", "Month", "Year", "All"]
+                value: root.periodOption(Model.periodKey(root.settingValue("barPeriod")))
+                foreground: root.barForeground
+                background: root.bar ? root.bar.background : Color.background
+                fontFamily: root.fontFamily
+                fontSize: Style.font.caption
+                // Stored as the manifest's own enum label, so a value set here
+                // and one set in Setup > Plugins are literally the same string.
+                onChanged: function(v) {
+                  root.writeSetting("barPeriod", Model.periodSettingLabel(root.optionPeriod(v)))
+                }
+              }
+
+              PanelSeparator { width: parent.width }
+
+              // ---- The rates the comparison assumes. Money is a text field
+              //      rather than a NumberField because these are decimals and
+              //      NumberField is integer-only.
+              Text {
+                width: parent.width
+                wrapMode: Text.WordWrap
+                textFormat: Text.PlainText
+                text: "RATES ASSUMED FOR THE COMPARISON  ·  per 1M tokens"
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+
+              Repeater {
+                model: [
+                  { key: "cloudInputPerMillion",       label: "Prompt processed" },
+                  { key: "cloudCachedInputPerMillion", label: "Prompt from cache" },
+                  { key: "cloudOutputPerMillion",      label: "Generated" },
+                  { key: "pricePerKwh",                label: "Electricity per kWh" }
+                ]
+
+                Row {
+                  id: rateRow
+                  required property var modelData
+                  width: setupColumn.width
+                  spacing: Style.space(6)
+
+                  Text {
+                    width: parent.width * 0.5
+                    anchors.verticalCenter: parent.verticalCenter
+                    textFormat: Text.PlainText
+                    text: rateRow.modelData.label
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.bodySmall
+                  }
+
+                  TextField {
+                    id: rateField
+                    width: Style.space(80)
+                    foreground: root.barForeground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.bodySmall
+                    // Bound, not initialised: a Reset elsewhere in this pane has
+                    // to be reflected here, and an unbound field would keep
+                    // showing the cleared value.
+                    text: String(root.settingValue(rateRow.modelData.key))
+                    // Committed on Enter or on leaving the field, never on every
+                    // keystroke — a half-typed "3." is not a price.
+                    onEditingFinished: root.writeSetting(rateRow.modelData.key, text)
+                  }
+                }
+              }
+
+              Row {
+                width: parent.width
+                spacing: Style.space(6)
+
+                Text {
+                  width: parent.width * 0.5
+                  anchors.verticalCenter: parent.verticalCenter
+                  textFormat: Text.PlainText
+                  text: "Currency symbol"
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                }
+
+                TextField {
+                  width: Style.space(80)
+                  foreground: root.barForeground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                  text: String(root.settingValue("currencySymbol"))
+                  onEditingFinished: root.writeSetting("currencySymbol", text)
+                }
+              }
+
+              // ---- Integers get the real control for the job.
+              NumberField {
+                label: "System draw while generating (W)"
+                value: Number(root.settingValue("systemWatts"))
+                from: 0
+                to: 2000
+                stepSize: 5
+                foreground: root.barForeground
+                fontFamily: root.fontFamily
+                fontSize: Style.font.bodySmall
+                onModified: function(v) { root.writeSetting("systemWatts", v) }
+              }
+
+              NumberField {
+                label: "Refresh (seconds)"
+                value: Number(root.settingValue("refreshIntervalSec"))
+                from: 2
+                to: 120
+                stepSize: 1
+                foreground: root.barForeground
+                fontFamily: root.fontFamily
+                fontSize: Style.font.bodySmall
+                onModified: function(v) { root.writeSetting("refreshIntervalSec", v) }
+              }
+
+              PanelSeparator { width: parent.width }
+
+              Toggle {
+                width: parent.width
+                label: "Import history from OpenCode"
+                description: "Fills windows live counters could not cover, using OpenCode's own exact per-reply counts. Read-only."
+                checked: root.settingValue("importOpencode") === true
+                foreground: root.barForeground
+                fontFamily: root.fontFamily
+                onClicked: root.writeSetting("importOpencode", !checked)
+              }
+
+              PanelSeparator { width: parent.width }
+
+              Row {
+                width: parent.width
+                spacing: Style.space(6)
+
+                Button {
+                  text: "Reset to Setup > Plugins"
+                  bordered: true
+                  foreground: root.barForeground
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.caption
+                  tooltipText: "Clear everything set here and go back to the values in shell.json"
+                  onClicked: if (root.hostWidget && root.hostWidget.resetOverrides) root.hostWidget.resetOverrides()
+                }
+              }
+
+              // The one setting deliberately not editable here. It is the only
+              // one with a security boundary attached, and keeping it in
+              // shell.json means the loopback rule has exactly one place it can
+              // be changed from.
+              Text {
+                width: parent.width
+                wrapMode: Text.WordWrap
+                textFormat: Text.PlainText
+                text: "The llama-swap endpoint stays in Setup > Plugins. It is the only setting with a "
+                      + "security boundary — loopback addresses only — so it has one place to be changed."
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+            }
+          }
+        }
+
         PanelSeparator {
           width: parent.width
           foreground: root.barForeground
-          visible: root.byModel.length > 0 && root.view !== "sessions"
+          visible: root.byModel.length > 0 && root.statsView
         }
 
         PanelSectionHeader {
           text: "By model"
           foreground: root.barForeground
           fontFamily: root.fontFamily
-          visible: root.byModel.length > 0 && root.view !== "sessions"
+          visible: root.byModel.length > 0 && root.statsView
         }
 
         Repeater {
@@ -512,7 +772,7 @@ Panel {
             id: modelRow
             required property var modelData
             width: content.width
-            visible: root.view !== "sessions"
+            visible: root.statsView
 
             Text {
               width: parent.width * 0.34
@@ -565,14 +825,14 @@ Panel {
         PanelSeparator {
           width: parent.width
           foreground: root.barForeground
-          visible: root.view !== "sessions"
+          visible: root.statsView
         }
 
         PanelSectionHeader {
           text: "Versus a hosted API"
           foreground: root.barForeground
           fontFamily: root.fontFamily
-          visible: root.view !== "sessions"
+          visible: root.statsView
         }
 
         Repeater {
@@ -596,7 +856,7 @@ Panel {
             required property var modelData
             required property int index
             width: content.width
-            visible: root.view !== "sessions"
+            visible: root.statsView
 
             Text {
               width: parent.width * 0.55
@@ -625,13 +885,13 @@ Panel {
         Text {
           width: parent.width
           wrapMode: Text.WordWrap
-          visible: root.view !== "sessions"
+          visible: root.statsView
           textFormat: Text.PlainText
           text: "Assumes " + root.currencySymbol + (root.rates.inputPerMillion || 0) + " prompt / "
                 + root.currencySymbol + (root.rates.cachedInputPerMillion || 0) + " cached prompt / "
                 + root.currencySymbol + (root.rates.outputPerMillion || 0)
                 + " generated, per 1M tokens; " + (root.rates.watts || 0) + "W at "
-                + root.currencySymbol + (root.rates.pricePerKwh || 0) + "/kWh. Change these in Setup > Plugins."
+                + root.currencySymbol + (root.rates.pricePerKwh || 0) + "/kWh. Change these under Setup, above."
           color: root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption

@@ -79,8 +79,14 @@ because the other source was assumed to have it.
 
 ### External dependencies
 
-All of these ship with Omarchy; nothing is installed by the plugin, and nothing
-runs as root.
+All of these are already on any Omarchy machine; nothing is installed by the
+plugin, and nothing runs as root. `curl` and `coreutils` are part of the base
+system, and `sqlite` is a hard dependency of `qt6-base`, which Omarchy requires
+through Quickshell — so `/usr/bin/sqlite3` is always present.
+
+If one were somehow missing, the plugin degrades rather than breaks: a
+non-zero exit is treated as "no data from this source", never as an empty
+result.
 
 | Command | Used for |
 |---|---|
@@ -128,6 +134,22 @@ omarchy bar move io.github.erikburdett.tokenstats --after omarchy.clock
 
 ## Settings
 
+Everything except the endpoint can be changed **from the widget itself** —
+click the widget, then **Setup**. `omarchy-shell io.github.erikburdett.tokenstats
+edit` opens the panel straight onto that pane, following the same convention as
+Omarchy's own weather widget, so it can be bound to a key.
+
+Changes apply immediately, across every monitor, and are saved to
+`~/.local/state/omarchy/tokenstats/settings.json` — a file this plugin owns.
+**`shell.json` is never written to.** It stays the base layer: Setup > Plugins
+still works, still supplies the defaults for a fresh install, and
+*Reset to Setup > Plugins* in the pane clears everything set in the panel and
+hands the settings back to it.
+
+The llama-swap endpoint is deliberately the one exception. It is the only
+setting with a security boundary attached — loopback addresses only — so it has
+exactly one place it can be changed from.
+
 In **Setup > Plugins > Token Stats**, or on the widget's entry in
 `~/.config/omarchy/shell.json`.
 
@@ -147,6 +169,19 @@ In **Setup > Plugins > Token Stats**, or on the widget's entry in
 The default cloud prices are a *stated assumption*, not a measurement — the
 plugin cannot know which service you would otherwise have used. They are printed
 on the panel next to the savings figure so the number is never a hidden guess.
+
+## Controlling it from a script or a keybinding
+
+```bash
+omarchy-shell io.github.erikburdett.tokenstats open     # show the panel
+omarchy-shell io.github.erikburdett.tokenstats close
+omarchy-shell io.github.erikburdett.tokenstats toggle
+omarchy-shell io.github.erikburdett.tokenstats edit     # open it on the Setup pane
+omarchy-shell io.github.erikburdett.tokenstats refresh  # sample now
+```
+
+`edit` follows the same convention as Omarchy's own `omarchy-shell
+omarchy.weather edit`, so it can be bound to a key in `hyprland.conf`.
 
 ## How the numbers are produced
 

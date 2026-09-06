@@ -132,6 +132,130 @@ function sameModelSet(a, b) {
   return true
 }
 
+// ------------------------------------------------------- panel-set settings
+
+// Settings the panel is allowed to write, with the shape each value must have.
+// This is an ALLOW-LIST, not documentation: parseSettings and applySetting both
+// gate on it, so a malformed stored file or a mis-typed call cannot introduce a
+// key the widget never expected or a value of the wrong type.
+//
+// These are *overrides*. shell.json remains the base — Setup > Plugins still
+// works and is still where a fresh install gets its defaults — and clearing an
+// override falls back to it. The plugin never writes shell.json: that is the
+// user's own bar layout, and rewriting it from a widget is the sort of thing
+// the marketplace checklist asks about by name. Omarchy's own weather panel
+// takes the same approach, persisting to a state file it owns rather than to
+// the user's configuration.
+var SETTING_SPECS = {
+  barPeriod:                  { kind: "enum", options: ["This hour", "Today", "7 days", "30 days", "12 months", "All recorded"] },
+  refreshIntervalSec:         { kind: "int", min: 2, max: 120 },
+  cloudInputPerMillion:       { kind: "money" },
+  cloudCachedInputPerMillion: { kind: "money" },
+  cloudOutputPerMillion:      { kind: "money" },
+  systemWatts:                { kind: "int", min: 0, max: 2000 },
+  pricePerKwh:                { kind: "money" },
+  currencySymbol:             { kind: "text", max: 3 },
+  importOpencode:             { kind: "bool" }
+}
+
+// The built-in default for every setting, used when neither the panel nor
+// shell.json has a value. These MUST equal manifest.json's `defaults` block, or
+// the Setup pane would show one number while a fresh install used another;
+// test/tokenmodel-test.mjs reads the manifest and asserts exactly that, so the
+// two cannot drift apart unnoticed.
+var SETTING_DEFAULTS = {
+  barPeriod: "Today",
+  refreshIntervalSec: 10,
+  cloudInputPerMillion: "3.00",
+  cloudCachedInputPerMillion: "0.30",
+  cloudOutputPerMillion: "15.00",
+  systemWatts: 120,
+  pricePerKwh: "0.12",
+  currencySymbol: "$",
+  importOpencode: true
+}
+
+function settingDefault(key) {
+  var v = SETTING_DEFAULTS[String(key)]
+  return v === undefined ? "" : v
+}
+
+function isSettingKey(key) {
+  return Object.prototype.hasOwnProperty.call(SETTING_SPECS, String(key))
+}
+
+// Coerce a value to the shape its key demands, or return undefined to mean
+// "not storable" — the caller then leaves the override unset and shell.json
+// keeps deciding. Money is kept as a STRING because that is what the manifest
+// schema declares and what the settings UI round-trips; it is validated as a
+// number here so a stored file can never put a NaN into a price.
+function coerceSetting(key, value) {
+  var spec = SETTING_SPECS[String(key)]
+  if (!spec) return undefined
+
+  if (spec.kind === "bool") return value === true || value === "true"
+
+  if (spec.kind === "int") {
+    var n = Math.round(Number(value))
+    if (!isNum(n)) return undefined
+    return Math.min(Math.max(n, spec.min), spec.max)
+  }
+
+  if (spec.kind === "money") {
+    var raw = String(value === undefined || value === null ? "" : value).trim()
+    if (raw.length === 0 || raw.length > 12) return undefined
+    if (!/^[0-9]+(\.[0-9]{1,4})?$/.test(raw)) return undefined
+    var m = Number(raw)
+    if (!isNum(m) || m < 0 || m > 1000) return undefined
+    return raw
+  }
+
+  if (spec.kind === "enum") {
+    var t = String(value === undefined || value === null ? "" : value)
+    return spec.options.indexOf(t) === -1 ? undefined : t
+  }
+
+  // text
+  var str = String(value === undefined || value === null ? "" : value)
+  if (str.length === 0) return undefined
+  return str.substring(0, spec.max)
+}
+
+// Stored overrides are local state, so they are attacker-controlled in the same
+// threat model as history.json: parsed defensively, unknown keys dropped, every
+// value re-coerced rather than trusted.
+function parseSettings(text) {
+  var out = {}
+  var raw = String(text === undefined || text === null ? "" : text)
+  if (raw.length === 0 || raw.length > MAX_STATE_BYTES) return out
+  var doc
+  try {
+    doc = JSON.parse(raw)
+  } catch (e) {
+    return out
+  }
+  if (!doc || typeof doc !== "object") return out
+  for (var key in SETTING_SPECS) {
+    if (!Object.prototype.hasOwnProperty.call(doc, key)) continue
+    var v = coerceSetting(key, doc[key])
+    if (v !== undefined) out[key] = v
+  }
+  return out
+}
+
+// Returns a NEW object: assigning the same reference back would not notify any
+// binding, and every displayed setting is a binding.
+function applySetting(overrides, key, value) {
+  var out = {}
+  var src = overrides && typeof overrides === "object" ? overrides : {}
+  for (var k in src) if (isSettingKey(k)) out[k] = src[k]
+  if (!isSettingKey(key)) return out
+  if (value === null) { delete out[key]; return out }
+  var coerced = coerceSetting(key, value)
+  if (coerced !== undefined) out[key] = coerced
+  return out
+}
+
 // ---------------------------------------------------------------- deltas
 
 // Counters are per llama-server process, so they restart at zero whenever
@@ -632,6 +756,24 @@ var PERIOD_KEYS = {
   "30 days": "month",
   "12 months": "year",
   "all recorded": "all"
+}
+
+// The inverse of periodKey: an internal key back to the exact label the
+// manifest's enum declares. The Setup pane stores the manifest label, not the
+// internal key, so a value set in the panel and a value set in Setup > Plugins
+// are the same string and either can be read by the other.
+var PERIOD_SETTING_LABELS = {
+  hour: "This hour",
+  day: "Today",
+  week: "7 days",
+  month: "30 days",
+  year: "12 months",
+  all: "All recorded"
+}
+
+function periodSettingLabel(key) {
+  var label = PERIOD_SETTING_LABELS[String(key)]
+  return label === undefined ? "Today" : label
 }
 
 function periodKey(label) {

@@ -6,6 +6,39 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.3.0] — 2026-09-06
+
+### Added
+
+- **A Setup pane in the widget's own panel.** Everything tunable — the window
+  the bar averages over, all four assumed rates, the currency symbol, system
+  watts, refresh interval and the OpenCode import — can now be changed by
+  clicking the widget, without opening Setup > Plugins or editing any file.
+  Changes apply immediately and across every monitor.
+- `omarchy-shell io.github.erikburdett.tokenstats edit` opens the panel straight
+  onto that pane, matching the convention Omarchy's own weather widget uses, so
+  it can be bound to a key.
+
+### Changed
+
+- Panel-set values are stored in
+  `~/.local/state/omarchy/tokenstats/settings.json`, a file this plugin owns.
+  **`shell.json` is never written to.** It remains the base layer: Setup >
+  Plugins still supplies the defaults, and *Reset to Setup > Plugins* clears
+  every panel-set value and hands the settings back to it. Omarchy's own weather
+  panel persists its configuration the same way, to a state file rather than to
+  the user's configuration.
+- The llama-swap endpoint is deliberately **not** settable from the panel. It is
+  the only setting with a security boundary attached, so it keeps exactly one
+  place it can be changed from.
+- Stored overrides are parsed against an allow-list and every value re-coerced —
+  unknown keys are dropped, enums must match the manifest's own option list,
+  prices must parse as a number in range, and integers are clamped. A hand-edited
+  file cannot introduce a setting the widget never expected.
+- Tests now read `manifest.json` and assert that every default, every settable
+  key and the `barPeriod` option list agree with the model, so the pane and a
+  fresh install can never drift apart unnoticed.
+
 ## [1.2.0] — 2026-09-06
 
 ### Fixed
