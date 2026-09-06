@@ -6,6 +6,38 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.4.0] — 2026-09-06
+
+### Fixed
+
+- **The plugin counted nothing on machines that are not set up like the
+  author's.** Three things were hardcoded to one machine, each failing silently:
+  - **Only llama-swap was supported.** A `llama-server` run directly serves its
+    counters at `/metrics`, returns `404` for `/upstream/<id>/metrics`, and its
+    `/v1/models` carries no `status` field at all — so nothing was ever
+    identified as loaded and no endpoint was ever polled. The server shape is
+    now detected and both are handled.
+  - **The endpoint was fixed at `127.0.0.1:8080`.** It now defaults to `auto`
+    and probes the usual loopback ports one per refresh until one answers, then
+    stays there, and resumes looking if it goes away. An explicit endpoint still
+    overrides, and is still accepted only if it is loopback.
+  - **OpenCode imports were filtered to `providerID = 'local'`,** which is
+    nothing but the name this machine's `opencode.json` happened to use. Local
+    providers are now read from `opencode.json` — any provider whose `baseURL`
+    points at loopback — so `llamacpp`, `lmstudio` or any other name works.
+    Provider ids are validated against `^[A-Za-z0-9._-]{1,64}$` before being
+    concatenated into SQL.
+- OpenCode's database and config are located through `XDG_DATA_HOME` and
+  `XDG_CONFIG_HOME` rather than an assumed `~/.local/share` and `~/.config`.
+
+### Added
+
+- `scripts/diagnose.sh` — read-only, loopback-only, never starts a model. Checks
+  each thing the plugin needs in the order it needs them and names the one that
+  is missing, so "showing nothing" is answerable without reading the source.
+- The panel footer now names the endpoint it found, the server shape, and the
+  providers it is importing. A zero says why it is zero.
+
 ## [1.3.1] — 2026-09-06
 
 ### Documentation

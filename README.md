@@ -54,13 +54,35 @@ from you:
 
 | What you already run | Counts with zero configuration? |
 |---|---|
-| Local models through **OpenCode** | **Yes.** OpenCode stores the provider's own `usage` block for every reply, so the counts are exact and already on disk. |
-| **llama.cpp** with `--metrics` enabled | **Yes**, for every client, plus live tokens/second. |
+| **llama-swap** | **Yes.** Found by probing loopback; every resident model is sampled. |
+| **llama-server** run directly, no proxy | **Yes.** Its counters live at `/metrics` rather than `/upstream/<id>/metrics`, and the shape is detected rather than assumed. |
+| Local models through **OpenCode** | **Yes.** OpenCode stores the provider's own `usage` block for every reply, so the counts are exact and already on disk. Which of your providers are local is read from your `opencode.json`, not guessed. |
 | llama.cpp without `--metrics`, and no OpenCode | No — there is no exact record to read, and this plugin will not estimate one. |
+
+**Nothing is hardcoded to one machine.** The endpoint defaults to `auto`: the
+plugin probes the usual loopback ports (`8080`, `8081`, `8000`, `5000`, `11434`)
+one per refresh until something answers, then stays there, and starts looking
+again if it goes away. Set an explicit `http://127.0.0.1:PORT` only if yours is
+somewhere unusual. OpenCode's database and config are located through
+`XDG_DATA_HOME` / `XDG_CONFIG_HOME`.
 
 The two sources run side by side and are separated per model, so having both
 counts everything exactly once. The panel always names the source it is using,
 so a zero is never ambiguous between "idle" and "misconfigured".
+
+### If it is showing nothing
+
+Run the bundled diagnostic. It checks each thing the plugin needs, in the order
+the plugin needs it, and names the one that is missing:
+
+```bash
+~/.config/omarchy/plugins/io.github.erikburdett.tokenstats/scripts/diagnose.sh
+```
+
+It is read-only, talks to loopback only, and never starts a model. Pass an
+endpoint as its first argument to check a specific one. The panel footer says
+the same thing in one line — which endpoint it found, which shape it is, and
+which providers it is importing.
 
 ### Verifying that for yourself
 

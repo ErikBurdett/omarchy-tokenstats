@@ -76,14 +76,41 @@ BarWidget {
   readonly property real pricePerKwh: Math.min(Math.max(Number(setting("pricePerKwh", 0.12)), 0), 10)
   readonly property string currencySymbol: String(setting("currencySymbol", "$")).substring(0, 3)
   readonly property bool importOpencode: setting("importOpencode", true) === true
-  readonly property string opencodeDb: Quickshell.env("HOME") + "/.local/share/opencode/opencode.db"
 
-  readonly property string endpoint: {
-    // Only a loopback endpoint is accepted. This value is fetched by curl, so a
-    // shell.json edit must not be able to point it at an arbitrary host.
-    var raw = String(setting("endpoint", "http://127.0.0.1:8080"))
-    return /^https?:\/\/(127\.0\.0\.1|localhost)(:\d{1,5})?$/.test(raw) ? raw : "http://127.0.0.1:8080"
-  }
+  // XDG, not a hardcoded ~/.local. A machine that sets XDG_DATA_HOME or
+  // XDG_CONFIG_HOME keeps OpenCode somewhere else entirely, and assuming
+  // otherwise is one more way for this to silently find nothing.
+  readonly property string xdgData: Quickshell.env("XDG_DATA_HOME") !== ""
+                                    ? Quickshell.env("XDG_DATA_HOME")
+                                    : Quickshell.env("HOME") + "/.local/share"
+  readonly property string xdgConfig: Quickshell.env("XDG_CONFIG_HOME") !== ""
+                                      ? Quickshell.env("XDG_CONFIG_HOME")
+                                      : Quickshell.env("HOME") + "/.config"
+  readonly property string opencodeDb: xdgData + "/opencode/opencode.db"
+  readonly property string opencodeConfig: xdgConfig + "/opencode/opencode.json"
+
+  // Provider ids that opencode.json says point at loopback — i.e. the ones
+  // actually running on this machine. Empty until the config is read.
+  property var localProviders: []
+  // Last resort. "local" is only a convention, but it is a common one and a
+  // better guess than importing every provider, which would count hosted API
+  // usage as if it had run here.
+  readonly property var effectiveProviders: localProviders.length > 0 ? localProviders : ["local"]
+
+  // An explicit endpoint, or "" meaning "find it". Only a loopback endpoint is
+  // ever accepted: this value is fetched by curl, so neither a shell.json edit
+  // nor discovery may point it at another host.
+  readonly property string endpointOverride: Model.endpointSetting(setting("endpoint", "auto"))
+  // Discovered by probing the candidate ports one per tick until one answers.
+  property string activeEndpoint: ""
+  property string probing: ""
+  property int probeIndex: 0
+  readonly property string endpoint: endpointOverride !== "" ? endpointOverride : activeEndpoint
+
+  // "swap"   - llama-swap: per-model status, counters at /upstream/<id>/metrics
+  // "direct" - llama-server on its own: counters at /metrics
+  property string serverShape: "none"
+  property string directModel: ""
 
   readonly property var rates: ({
     inputPerMillion: root.inputPerMillion,
@@ -220,9 +247,20 @@ BarWidget {
     root.sweepStart = Date.now()
     root.sweepClean = true
     root.sweepMetricsOk = 0
+    // With no endpoint yet, each tick tries the next candidate. Discovery costs
+    // exactly one loopback request per tick and stops as soon as something
+    // answers with a shape we recognise.
+    var target = root.endpoint
+    if (target === "") {
+      var list = Model.ENDPOINT_CANDIDATES
+      target = list[root.probeIndex % list.length]
+      root.probing = target
+    } else {
+      root.probing = ""
+    }
     root.pendingKind = "models"
     root.pendingModel = ""
-    pollProc.command = root.curlArgs.concat([root.endpoint + "/v1/models"])
+    pollProc.command = root.curlArgs.concat([target + "/v1/models"])
     pollWatchdog.restart()
     pollProc.running = true
   }
@@ -234,9 +272,14 @@ BarWidget {
     root.sweepQueue = queue
     root.pendingKind = "metrics"
     root.pendingModel = model
-    // `model` came from parseLoadedModels, which validates the id against
-    // /^[A-Za-z0-9._-]{1,40}$/ before it is ever interpolated into this path.
-    pollProc.command = root.curlArgs.concat([root.endpoint + "/upstream/" + model + "/metrics"])
+    // Direct llama-server keeps its counters at a fixed /metrics; only the
+    // llama-swap shape puts a model id in the path, and that id came from
+    // parseLoadedModels, which validates it against /^[A-Za-z0-9._-]{1,40}$/
+    // before it can be interpolated here.
+    var url = root.serverShape === "direct"
+              ? root.endpoint + "/metrics"
+              : root.endpoint + "/upstream/" + model + "/metrics"
+    pollProc.command = root.curlArgs.concat([url])
     pollWatchdog.restart()
     pollProc.running = true
   }
@@ -312,6 +355,7 @@ BarWidget {
     // A fresh install has no state directory, and FileView will not create one,
     // so the first write would fail silently and history would never persist.
     mkdirProc.running = true
+    opencodeConfigFile.reload()
     overridesFile.reload()
     historyFile.reload()
     refresh()
@@ -353,7 +397,32 @@ BarWidget {
         root.applyMetrics(text, model)
         root.pollNextModel()
       } else if (kind === "models") {
-        var found = Model.parseLoadedModels(text)
+        var shape = Model.detectServerShape(text)
+        if (shape === "none") {
+          // Nothing usable here. If we were probing, move on to the next
+          // candidate; if this was our established endpoint, it has gone away
+          // and we start looking again rather than polling a dead port forever.
+          if (root.probing !== "") root.probeIndex += 1
+          else root.activeEndpoint = ""
+          root.probing = ""
+          root.serverShape = "none"
+          for (var g = 0; g < root.residentModels.length; g++) root.forgetSample(root.residentModels[g])
+          root.residentModels = []
+          root.sweepClean = false
+          root.finishSweep()
+          return
+        }
+        // Something answered: adopt it.
+        if (root.probing !== "") { root.activeEndpoint = root.probing; root.probing = "" }
+        root.serverShape = shape
+
+        var found
+        if (shape === "direct") {
+          root.directModel = Model.directModelName(text)
+          found = root.directModel === "" ? [] : [root.directModel]
+        } else {
+          found = Model.parseLoadedModels(text)
+        }
         // A model leaving takes its baseline with it: the next llama-server for
         // that id starts its counters at zero.
         for (var i = 0; i < root.residentModels.length; i++)
@@ -457,6 +526,20 @@ BarWidget {
   // watchChanges so every bar surface — one per monitor — picks up a change made
   // in any one of their panels, rather than the others sitting stale until a
   // restart. atomicWrites for the same reason history.json uses it.
+  // OpenCode's own config, watched. It is the only place that says which of a
+  // user's providers actually run on this machine — the message rows carry a
+  // providerID but nothing that distinguishes local from hosted, and the id is
+  // whatever the user named it. Read-only; the plugin never writes here.
+  FileView {
+    id: opencodeConfigFile
+    path: root.opencodeConfig
+    printErrors: false
+    watchChanges: true
+    onFileChanged: reload()
+    onLoaded: root.localProviders = Model.parseLocalProviders(text())
+    onLoadFailed: root.localProviders = []
+  }
+
   FileView {
     id: overridesFile
     path: root.overridesPath
@@ -536,7 +619,10 @@ BarWidget {
       "   + coalesce(json_extract(data,'$.tokens.cache.write'),0)" +
       " from message" +
       " where json_extract(data,'$.role')='assistant'" +
-      "   and json_extract(data,'$.providerID')='local'" +
+      // Which providers count as local is read from opencode.json, not assumed.
+      // providerFilterSql re-validates every id against /^[A-Za-z0-9._-]{1,64}$/
+      // before it is concatenated, so nothing here can carry a quote.
+      Model.providerFilterSql(root.effectiveProviders) +
       "   and json_extract(data,'$.time.completed') > " + since +
       " order by 1 limit " + root.maxImportRows + ";"
     ])
@@ -800,14 +886,25 @@ BarWidget {
   readonly property string sourceLine: {
     switch (sourceState) {
       case "live":
-        return root.residentModels.length > 1
-          ? "Counting live from llama.cpp across " + root.residentModels.length
-            + " resident models, with OpenCode filling any gap"
-          : "Counting live from llama.cpp, with OpenCode filling any gap"
+        return "Counting live from llama.cpp (" + root.serverShape + ") at "
+               + root.endpoint
+               + (root.residentModels.length > 1
+                  ? " across " + root.residentModels.length + " resident models" : "")
+               + ", with OpenCode filling any gap"
       case "opencode":
-        return "Counting from OpenCode's records. Enable llama.cpp metrics for live throughput and non-OpenCode clients."
+        return "Counting from OpenCode's records for "
+               + root.effectiveProviders.join(", ")
+               + ". Enable llama.cpp metrics for live throughput and non-OpenCode clients."
       default:
-        return "No token source yet. Run a local model through OpenCode, or enable llama.cpp metrics."
+        // A zero has to say WHY, or it is indistinguishable from idle. Name the
+        // thing that is missing rather than listing everything it could be.
+        if (root.endpoint === "")
+          return "Looking for llama.cpp on loopback — none of the usual ports answered. "
+                 + "Set the endpoint under Setup if yours is elsewhere, or run scripts/diagnose.sh."
+        if (root.residentModels.length === 0)
+          return "Reached " + root.endpoint + " but no model is loaded. Run one."
+        return "Reached " + root.endpoint + " but its counters are off. "
+               + "Start llama-server with --metrics, or run a model through OpenCode."
     }
   }
 

@@ -15,7 +15,10 @@ new Function("exports", src + `;Object.assign(exports,{
   parseSessions, cleanTitle, shortWhen,
   coverageFloor, markCovered, coveredFor, reconcileImport, cacheHitPercent,
   parseSettings, applySetting, coerceSetting, isSettingKey, periodSettingLabel,
-  settingDefault, SETTING_DEFAULTS, SETTING_SPECS });`)(M)
+  settingDefault, SETTING_DEFAULTS, SETTING_SPECS,
+  detectServerShape, directModelName, shortModelName, endpointSetting,
+  isLoopbackEndpoint, isLoopbackBaseUrl, parseLocalProviders, providerFilterSql,
+  ENDPOINT_CANDIDATES });`)(M)
 
 let fails = 0
 const check = (name, actual, expected) => {
@@ -300,6 +303,66 @@ const crow = M.parseOpencodeRows("1788542714634|20|5|0|coder|880", 0, Number.MAX
 check("import reads cache.read + cache.write", crow.promptCached, 880)
 check("import without a cache column is zero",
       M.parseOpencodeRows("1788542714634|20|5|0|coder", 0, Number.MAX_SAFE_INTEGER)[0].promptCached, 0)
+
+console.log("machine-agnostic discovery")
+// llama.cpp is reachable two ways and they are not the same shape. Assuming
+// llama-swap is why this counted nothing on a machine running llama-server
+// directly: no entry had status "loaded", so nothing was ever polled.
+const SWAP = JSON.stringify({ data: [
+  { id: "coder", status: { value: "loaded" } },
+  { id: "tiny",  status: { value: "unloaded" } }]})
+const DIRECT = JSON.stringify({ data: [{ id: "unsloth/Qwen3-0.6B-GGUF:Q4_K_M" }]})
+check("llama-swap shape", M.detectServerShape(SWAP), "swap")
+check("direct llama-server shape", M.detectServerShape(DIRECT), "direct")
+check("empty list is neither", M.detectServerShape('{"data":[]}'), "none")
+check("garbage is neither", M.detectServerShape("{{{"), "none")
+check("direct model name is shortened for display",
+      M.directModelName(DIRECT), "Qwen3-0.6B-GGUF")
+check("direct with no id still names something",
+      M.directModelName('{"data":[{}]}'), "llama.cpp")
+check("shortModelName strips path and quant", M.shortModelName("a/b/Model-Name:Q4"), "Model-Name")
+
+// Endpoint: "auto"/"" means discover; anything non-loopback is refused.
+check("auto means discover", M.endpointSetting("auto"), "")
+check("blank means discover", M.endpointSetting(""), "")
+check("explicit loopback honoured", M.endpointSetting("http://127.0.0.1:9999"), "http://127.0.0.1:9999")
+check("localhost honoured", M.endpointSetting("http://localhost:8080"), "http://localhost:8080")
+check("non-loopback refused, falls back to discovery",
+      M.endpointSetting("http://evil.example"), "")
+check("a path is refused", M.endpointSetting("http://127.0.0.1:8080/x"), "")
+check("every discovery candidate is loopback",
+      M.ENDPOINT_CANDIDATES.every(M.isLoopbackEndpoint), true)
+
+console.log("local provider detection")
+// A message row carries providerID but nothing saying whether it is local, and
+// the id is only what the user named it — "local" here, "llamacpp" elsewhere.
+// Hardcoding one name is why the importer found nothing on another machine.
+const OCCFG = JSON.stringify({ provider: {
+  local:     { options: { baseURL: "http://127.0.0.1:8080/v1" } },
+  llamacpp:  { options: { baseURL: "http://localhost:9000/v1" } },
+  anthropic: { options: { baseURL: "https://api.anthropic.com" } },
+  "bad id!": { options: { baseURL: "http://127.0.0.1:1/v1" } }
+}})
+check("only loopback providers are local",
+      M.parseLocalProviders(OCCFG), ["llamacpp", "local"])
+check("no config is no providers", M.parseLocalProviders(""), [])
+check("garbage config is no providers", M.parseLocalProviders("{{{"), [])
+check("a baseURL is a host check, not a whole-string match",
+      M.isLoopbackBaseUrl("http://127.0.0.1:8080/v1"), true)
+check("a hosted baseURL is not loopback",
+      M.isLoopbackBaseUrl("https://api.anthropic.com/v1"), false)
+
+// Provider ids are concatenated into SQL, so they are validated, not quoted
+// and hoped for.
+check("filter is built from validated ids",
+      M.providerFilterSql(["local", "llamacpp"]),
+      " and json_extract(data,'$.providerID') in ('local','llamacpp')")
+check("no providers means no filter clause", M.providerFilterSql([]), "")
+check("an id that could break out of the quoting is dropped",
+      M.providerFilterSql(["x'); drop table message;--"]), "")
+check("a hostile id does not poison its valid siblings",
+      M.providerFilterSql(["local", "x' or '1'='1"]),
+      " and json_extract(data,'$.providerID') in ('local')")
 
 console.log("panel-set settings")
 // These are written by the Setup pane into a file this plugin owns. shell.json

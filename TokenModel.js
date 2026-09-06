@@ -123,6 +123,151 @@ function parseLoadedModels(jsonText) {
   return out.sort()
 }
 
+// Where a local llama.cpp lives, in the order worth trying. Nothing here is a
+// guess about THIS machine: 8080 is both llama-swap's and llama-server's own
+// default, and the rest are the ports people commonly move them to. Discovery
+// costs one loopback request per tick until something answers, then stops.
+//
+// This exists so the plugin has nothing to configure. Defaulting to a single
+// port and calling that "no setup required" only works on a machine that
+// happens to match it.
+var ENDPOINT_CANDIDATES = [
+  "http://127.0.0.1:8080",
+  "http://127.0.0.1:8081",
+  "http://127.0.0.1:8000",
+  "http://127.0.0.1:5000",
+  "http://127.0.0.1:11434"
+]
+
+// Loopback only, always. An endpoint reaches curl, so a settings edit must not
+// be able to point it at another host — and neither must discovery.
+var LOOPBACK_RE = /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d{1,5})?$/
+
+function isLoopbackEndpoint(raw) {
+  return LOOPBACK_RE.test(String(raw === undefined || raw === null ? "" : raw))
+}
+
+// "" / "auto" mean discover. Anything else is honoured only if it is loopback.
+function endpointSetting(raw) {
+  var v = String(raw === undefined || raw === null ? "" : raw).trim()
+  if (v === "" || v.toLowerCase() === "auto") return ""
+  return isLoopbackEndpoint(v) ? v : ""
+}
+
+// A provider id is a key in the user's opencode.json and goes into SQL, so it
+// is VALIDATED, never quoted-and-hoped. Nothing outside this shape can carry a
+// quote, so the generated IN list cannot be broken out of.
+var PROVIDER_ID_RE = /^[A-Za-z0-9._-]{1,64}$/
+
+// Unlike the endpoint, a baseURL legitimately has a path ("/v1"), so this is a
+// host check rather than a whole-string match.
+function isLoopbackBaseUrl(raw) {
+  return /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d{1,5})?(\/|$)/
+    .test(String(raw === undefined || raw === null ? "" : raw))
+}
+
+// Which OpenCode providers actually run on this machine.
+//
+// The message rows carry a providerID but nothing that says whether it is
+// local, and the id itself is just whatever the user named it — "local" here,
+// but as easily "llamacpp" or "lmstudio" elsewhere. Hardcoding one name is why
+// the importer found nothing on another machine. opencode.json is the only
+// place that knows: a provider whose baseURL points at loopback is running
+// here.
+function parseLocalProviders(configText) {
+  var out = []
+  var raw = String(configText === undefined || configText === null ? "" : configText)
+  if (raw.length === 0 || raw.length > MAX_STATE_BYTES) return out
+  var doc
+  try {
+    doc = JSON.parse(raw)
+  } catch (e) {
+    return out
+  }
+  var providers = doc && doc.provider
+  if (!providers || typeof providers !== "object") return out
+  var keys = Object.keys(providers)
+  var limit = keys.length < 64 ? keys.length : 64
+  for (var i = 0; i < limit; i++) {
+    var id = keys[i]
+    if (!PROVIDER_ID_RE.test(id)) continue
+    var p = providers[id]
+    var url = p && p.options ? p.options.baseURL : ""
+    if (!isLoopbackBaseUrl(url)) continue
+    if (out.indexOf(id) === -1) out.push(id)
+  }
+  return out.sort()
+}
+
+// A SQL IN list, or "" when there is nothing to filter on. Every id is
+// re-validated here rather than trusting the caller, because this string is
+// concatenated into a statement.
+function providerFilterSql(ids) {
+  if (!Array.isArray(ids) || ids.length === 0) return ""
+  var safe = []
+  for (var i = 0; i < ids.length && safe.length < 64; i++) {
+    if (PROVIDER_ID_RE.test(ids[i])) safe.push("'" + ids[i] + "'")
+  }
+  if (safe.length === 0) return ""
+  return " and json_extract(data,'$.providerID') in (" + safe.join(",") + ")"
+}
+
+// llama.cpp can be reached two ways and they are NOT the same shape:
+//
+//   llama-swap  /v1/models carries a per-model status, and each model's
+//               counters live at /upstream/<id>/metrics.
+//   llama-server (run directly, no proxy) — /v1/models has no status field at
+//               all, /upstream/... is 404, and the counters are at /metrics.
+//
+// Assuming the first shape is why this plugin counted nothing on a machine
+// running llama-server directly: parseLoadedModels found no entry with
+// status "loaded", so the sweep queue stayed empty and no endpoint was ever
+// read. Detect the shape instead of assuming it.
+function detectServerShape(jsonText) {
+  var doc
+  try {
+    doc = JSON.parse(String(jsonText || ""))
+  } catch (e) {
+    return "none"
+  }
+  var list = doc && doc.data
+  if (!Array.isArray(list) || list.length === 0) return "none"
+  for (var i = 0; i < list.length; i++) {
+    var m = list[i]
+    if (m && m.status && typeof m.status.value === "string") return "swap"
+  }
+  return "direct"
+}
+
+// The model a directly-run llama-server is serving. Its id is a repository
+// path like "unsloth/Qwen3-0.6B-GGUF:Q4_K_M", which is never interpolated into
+// a URL in this mode — the counters are at a fixed /metrics — so it only has to
+// be safe and legible as an object key.
+function directModelName(jsonText) {
+  var doc
+  try {
+    doc = JSON.parse(String(jsonText || ""))
+  } catch (e) {
+    return ""
+  }
+  var list = doc && doc.data
+  if (!Array.isArray(list) || list.length === 0) return ""
+  var first = list[0]
+  var id = first && typeof first.id === "string" ? first.id : ""
+  return shortModelName(id) || "llama.cpp"
+}
+
+// "unsloth/Qwen3-0.6B-GGUF:Q4_K_M" -> "Qwen3-0.6B-GGUF". The full path is
+// unreadable in a bar tooltip and useless as a per-model row label.
+function shortModelName(id) {
+  var raw = String(id === undefined || id === null ? "" : id)
+  var slash = raw.lastIndexOf("/")
+  if (slash !== -1) raw = raw.substring(slash + 1)
+  var colon = raw.indexOf(":")
+  if (colon !== -1) raw = raw.substring(0, colon)
+  return modelKey(raw)
+}
+
 // Whether the resident set changed between two sweeps. A change means a model
 // was swapped in or out while we were mid-sweep, so this sweep cannot claim to
 // have covered the whole period — see the watermark rule in TokenStats.qml.

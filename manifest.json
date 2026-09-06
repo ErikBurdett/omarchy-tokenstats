@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.erikburdett.tokenstats",
   "name": "Token Stats",
-  "version": "1.3.1",
+  "version": "1.4.0",
   "author": "Erik Burdett",
   "license": "MIT",
   "description": "Local LLM tokens per hour in the bar, with an exact-count graph, history and cloud comparison",
@@ -33,7 +33,7 @@
       "systemWatts": 120,
       "pricePerKwh": "0.12",
       "currencySymbol": "$",
-      "endpoint": "http://127.0.0.1:8080",
+      "endpoint": "auto",
       "importOpencode": true
     },
     "schema": [
@@ -107,9 +107,9 @@
       {
         "key": "endpoint",
         "type": "string",
-        "label": "llama-swap endpoint",
-        "description": "Loopback only. Anything else is ignored and the default is used.",
-        "defaultValue": "http://127.0.0.1:8080"
+        "label": "llama.cpp endpoint",
+        "description": "Leave as \"auto\" and the plugin finds it: it probes the usual loopback ports until one answers, and works with either llama-swap or a llama-server run directly. Set an explicit http://127.0.0.1:PORT only if yours is elsewhere. Loopback only \u2014 anything else is ignored.",
+        "defaultValue": "auto"
       },
       {
         "key": "importOpencode",
