@@ -577,7 +577,14 @@ Panel {
 
         Repeater {
           model: [
-            { key: "Prompt tokens",   value: Model.formatTokens(root.totals.p) },
+            // Split, because they are not the same thing and a hosted API
+            // prices them differently. "Processed" is the work this machine
+            // actually did; "from cache" is prompt the KV cache served, which
+            // llama.cpp and OpenCode both report separately and which an API
+            // would still have billed — at a reduced rate.
+            { key: "Prompt processed", value: Model.formatTokens(root.totals.p) },
+            { key: "Prompt from cache", value: Model.formatTokens(root.totals.pc)
+                                        + "  (" + Math.round(Model.cacheHitPercent(root.totals)) + "%)" },
             { key: "Generated",       value: Model.formatTokens(root.totals.c) },
             { key: "Cloud would cost", value: Model.formatMoney(root.money.cloud, root.currencySymbol) },
             { key: "Electricity",     value: Model.formatMoney(root.money.local, root.currencySymbol) },
@@ -620,9 +627,10 @@ Panel {
           wrapMode: Text.WordWrap
           visible: root.view !== "sessions"
           textFormat: Text.PlainText
-          text: "Assumes " + root.currencySymbol + (root.rates.inputPerMillion || 0) + " / "
+          text: "Assumes " + root.currencySymbol + (root.rates.inputPerMillion || 0) + " prompt / "
+                + root.currencySymbol + (root.rates.cachedInputPerMillion || 0) + " cached prompt / "
                 + root.currencySymbol + (root.rates.outputPerMillion || 0)
-                + " per 1M prompt/output tokens, " + (root.rates.watts || 0) + "W at "
+                + " generated, per 1M tokens; " + (root.rates.watts || 0) + "W at "
                 + root.currencySymbol + (root.rates.pricePerKwh || 0) + "/kWh. Change these in Setup > Plugins."
           color: root.dim
           font.family: root.fontFamily
@@ -634,7 +642,7 @@ Panel {
         Text {
           width: parent.width
           textFormat: Text.PlainText
-          text: (root.loadedModel !== "" ? "Model: " + root.loadedModel : "No model resident")
+          text: (root.loadedModel !== "" ? "Resident: " + root.loadedModel : "No model resident")
                 + (root.memInfo ? "   ·   " + Model.formatSize(root.memInfo.available) + " RAM available" : "")
           color: root.dim
           font.family: root.fontFamily

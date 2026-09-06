@@ -11,7 +11,7 @@ that grows a row of figures stops being glanceable. Everything else is a hover
 or a click away.
 
 - **Hover** — prompt tokens, generation rate, savings, RAM available, and which
-  model is resident.
+  models are resident.
 - **Click** — the panel: totals for any window, a bar graph, a history table,
   a sessions list, a per-model breakdown, and the savings arithmetic with its
   assumptions printed next to it.
@@ -31,9 +31,12 @@ or a click away.
 ## Counts are exact, not estimated
 
 Token counts come from llama.cpp's own Prometheus counters
-(`llamacpp:prompt_tokens_total`, `llamacpp:tokens_predicted_total`), reached
-through llama-swap at `/upstream/<model>/metrics`. They match the `usage` block
-of the API response exactly.
+(`llamacpp:prompt_tokens_total`, `llamacpp:prompt_tokens_cached_total`,
+`llamacpp:tokens_predicted_total`), reached through llama-swap at
+`/upstream/<model>/metrics`. They match the `usage` block of the API response
+exactly — including the prompt, which needs both of the first two counters and
+not just the obvious one. See [What the prompt figures
+mean](#what-the-prompt-figures-mean).
 
 The obvious alternative — estimating tokens from HTTP response size — is wrong
 by more than an order of magnitude, because a streamed response is mostly SSE
@@ -70,8 +73,9 @@ macros:
 Then `systemctl --user restart llama-swap`.
 
 The panel always says which source it is using, so you never have to guess
-whether this step took effect. The two sources are mutually exclusive by
-watermark — nothing is ever counted twice.
+whether this step took effect. The two sources run side by side, separated by a
+per-model watermark — nothing is ever counted twice, and nothing is dropped
+because the other source was assumed to have it.
 
 ### External dependencies
 
@@ -131,9 +135,10 @@ In **Setup > Plugins > Token Stats**, or on the widget's entry in
 |---|---|---|
 | Bar shows | `Today` | Window the per-hour rate is averaged over |
 | Import history from OpenCode | `on` | Backfill exact counts from OpenCode's database |
-| Refresh (seconds) | `10` | One loopback request per refresh |
+| Refresh (seconds) | `10` | One loopback request per resident model per refresh |
 | Cloud price per 1M prompt tokens | `3.00` | Set to the API you would otherwise use |
 | Cloud price per 1M generated tokens | `15.00` | |
+| Cloud price per 1M cached prompt tokens | `0.30` | Hosted APIs bill cache hits at a reduced rate, not free |
 | System draw while generating (W) | `120` | Used to cost your own electricity |
 | Electricity price per kWh | `0.12` | |
 | Currency symbol | `$` | |
@@ -158,10 +163,17 @@ once a minute. Retention is 72 hourly and 400 daily buckets — a few tens of Ki
 ### Backfill from OpenCode
 
 OpenCode records the provider's own `usage` block for every reply, so its
-database is an exact source for tokens generated before this widget existed or
-while the shell was not running. The plugin imports from it read-only, filtered
-to `providerID = local`, taking only rows between its watermark and the moment
-live sampling resumed — so nothing is ever counted twice.
+database is an exact source for tokens generated before this widget existed,
+while the shell was not running, or in any window live sampling could not vouch
+for. The plugin imports from it read-only, filtered to `providerID = local`.
+
+A row is admitted against **its own model's** coverage mark, not one global
+watermark. That distinction matters: llama-swap restarts one `llama-server` at a
+time, and its counters return to zero when it does, so coverage breaks for one
+model while the others are still being sampled cleanly. A single watermark would
+either over-claim for the model that reset — losing those tokens for good — or
+re-import for models that were counted live. Per-model marks let both sources
+run at once and still count every token exactly once.
 
 Imported rows carry **tokens only**. OpenCode's message wall clock includes tool
 calls and waiting: measured against this machine it reads 2 tok/s where the
@@ -172,6 +184,31 @@ says what the rate was measured on when the two differ.
 Backfilling from llama-swap's request log was considered and rejected: those
 lines carry only response byte sizes, which is the estimate this plugin exists
 to avoid.
+
+### What the prompt figures mean
+
+Prompt tokens are reported in **two** parts, because they are two different
+things and a hosted API prices them differently:
+
+- **Prompt processed** — tokens the model actually computed.
+  `llamacpp:prompt_tokens_total`, or OpenCode's `tokens.input`.
+- **Prompt from cache** — tokens served from the KV cache instead.
+  `llamacpp:prompt_tokens_cached_total`, or OpenCode's `tokens.cache.read`
+  plus `.write`.
+
+Processed **plus** cached is exactly the `prompt_tokens` an API reports.
+Verified: an identical repeated request reported `prompt_tokens 13` while the
+processed counter moved by 1 and the cached counter by 12.
+
+This matters more than it sounds. Both sources report only the *processed* half
+under the plain "input" name, and on real agent sessions the cache serves the
+overwhelming majority — measured here across four days, between 74% and 99% of
+every prompt. Counting only the processed half, which this plugin did before
+version 4, understated the prompt side of the cloud comparison by up to 74×.
+
+Generated tokens have no such subtlety and are exact from either source.
+
+## Savings
 
 `Net saved` is the cloud cost of the same tokens minus the electricity your
 hardware actually spent generating them. It does not charge notional rent for
@@ -188,10 +225,10 @@ Verified: generating a 169-token completion moved the sampled figure from 113 to
 
 ## Cost of running it
 
-One `curl` per refresh against loopback, plus two `FileView` reads. The session
-list is read only when its pane is opened. No log tailing, no repeated
-multi-megabyte parse, and nothing polls the upstream while no model is
-resident.
+One `curl` per resident model per refresh against loopback — typically two —
+plus two `FileView` reads. The session list is read only when its pane is
+opened. No log tailing, no repeated multi-megabyte parse, and nothing polls the
+upstream while no model is resident.
 
 ## History format versions
 
@@ -199,7 +236,9 @@ resident.
 rejected rather than migrated, which resets the watermark and triggers a full
 re-import from OpenCode — cheap, and it rebuilds history in the current shape
 instead of leaving old buckets permanently missing new fields. Version 2 added
-per-model attribution.
+per-model attribution. Version 3 added per-model coverage marks, and rebuilds
+history written while the widget was only ever sampling one model. Version 4
+added prompt-cache accounting.
 
 ## Development
 

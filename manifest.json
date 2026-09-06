@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.erikburdett.tokenstats",
   "name": "Token Stats",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "author": "Erik Burdett",
   "license": "MIT",
   "description": "Local LLM tokens per hour in the bar, with an exact-count graph, history and cloud comparison",
@@ -29,6 +29,7 @@
       "refreshIntervalSec": 10,
       "cloudInputPerMillion": "3.00",
       "cloudOutputPerMillion": "15.00",
+      "cloudCachedInputPerMillion": "0.30",
       "systemWatts": 120,
       "pricePerKwh": "0.12",
       "currencySymbol": "$",
@@ -55,7 +56,7 @@
         "key": "refreshIntervalSec",
         "type": "integer",
         "label": "Refresh (seconds)",
-        "description": "One loopback request per refresh. 10s is plenty; counters are cumulative so nothing is missed between polls.",
+        "description": "One loopback request per resident model per refresh. 10s is plenty; counters are cumulative so nothing is missed between polls.",
         "min": 2,
         "max": 120,
         "step": 1,
@@ -73,6 +74,13 @@
         "type": "string",
         "label": "Cloud price per 1M generated tokens",
         "defaultValue": "15.00"
+      },
+      {
+        "key": "cloudCachedInputPerMillion",
+        "type": "string",
+        "label": "Cloud price per 1M cached prompt tokens",
+        "description": "Hosted APIs bill prompt tokens served from their cache at a reduced rate rather than free. Most local prompt tokens are cache hits, so this rate, not the full one, dominates the comparison. Default is a tenth of the prompt rate.",
+        "defaultValue": "0.30"
       },
       {
         "key": "systemWatts",
