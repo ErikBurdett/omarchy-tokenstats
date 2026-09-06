@@ -86,7 +86,7 @@ runs as root.
 |---|---|
 | `/usr/bin/curl` | Reading the llama-swap and llama.cpp endpoints over loopback |
 | `/usr/bin/sqlite3` | Reading OpenCode's database, **read-only**, for backfill and the sessions list |
-| `/usr/bin/mkdir` | Creating this plugin's own state directory on first run |
+| `/usr/bin/install` | Creating this plugin's own state directory, mode 0700 (`install -d` rather than `mkdir -p -m`, because it also corrects the mode of a directory that already exists) |
 | `/usr/bin/omarchy-launch-tui` | Opening a terminal when you click a session (Omarchy's own launcher) |
 
 The plugin never writes to OpenCode's database — it is opened with
