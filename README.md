@@ -1,8 +1,9 @@
 # Token Stats
 
 Exact token counts from your local LLMs in the Omarchy bar, with a graph,
-browsable history, and an honest comparison against what a hosted API would
-have charged.
+browsable history, an honest comparison against what a hosted API would have
+charged — and your cloud coding agents (Claude Code and Codex) tracked beside
+them, with every AI session on this machine in one resumable list.
 
 ![Token Stats in the bar with its panel open](preview.png)
 
@@ -10,17 +11,25 @@ The bar carries **one number** — `TS: 8.2k tokens/hour` — because a bar widg
 that grows a row of figures stops being glanceable. Everything else is a hover
 or a click away.
 
-- **Hover** — prompt tokens, generation rate, savings, RAM available, and which
-  models are resident.
+- **Hover** — prompt tokens, generation rate, savings, RAM available, which
+  models are resident, and what your cloud agents generated in the same window.
 - **Click** — the panel: totals for any window, a bar graph, a history table,
-  a sessions list, a per-model breakdown, and the savings arithmetic with its
-  assumptions printed next to it.
+  an agents view, a sessions list, a per-model breakdown, and the savings
+  arithmetic with its assumptions printed next to it.
 - **Graph** — hover any bar and a readout follows the pointer with the exact
   weekday, date, time span and token count. The axis carries real dates, and a
-  rule marks each day boundary.
-- **Sessions** — your OpenCode sessions ranked by tokens generated, titled from
-  what you actually asked for. **Click one to resume it** in a terminal, in its
-  own working directory.
+  rule marks each day boundary. A source selector turns the same graph and
+  history table into **Claude Code's or Codex's** — with estimated spend in
+  the header instead of a throughput rate.
+- **Agents** — what Claude Code and Codex consumed in the selected window, per
+  model, with estimated spend at published per-1M rates. Kept strictly apart
+  from the local numbers: those tokens were paid for, and folding them into
+  the savings figure would corrupt it.
+- **Sessions** — every AI session on this machine — OpenCode, Claude Code and
+  Codex — in one list, newest first, titled from what you actually asked for.
+  Filter by source, **search as you type** across title, model and directory,
+  and **click one to resume it** in a terminal, in its own working directory,
+  with the right tool.
 - **Honest about its source** — the panel names where the numbers come from, and
   what enabling llama.cpp metrics would add.
 - **By model** — how many tokens each model produced, its share of the window,
@@ -145,11 +154,14 @@ result.
 |---|---|
 | `/usr/bin/curl` | Reading the llama-swap and llama.cpp endpoints over loopback |
 | `/usr/bin/sqlite3` | Reading OpenCode's database, **read-only**, for backfill and the sessions list |
+| `/usr/bin/jq` | Parsing Claude Code's and Codex's own session records (`scripts/scan-agents.sh`), read-only |
 | `/usr/bin/install` | Creating this plugin's own state directory, mode 0700 (`install -d` rather than `mkdir -p -m`, because it also corrects the mode of a directory that already exists) |
 | `/usr/bin/omarchy-launch-tui` | Opening a terminal when you click a session (Omarchy's own launcher) |
 
 The plugin never writes to OpenCode's database — it is opened with
-`sqlite3 -readonly` against a `mode=ro` URI.
+`sqlite3 -readonly` against a `mode=ro` URI — and never writes anything under
+`~/.claude` or `~/.codex`; the scan script only reads them and emits bounded
+pipe-separated rows.
 
 ## Install
 
@@ -210,6 +222,8 @@ In **Setup > Plugins > Token Stats**, or on the widget's entry in
 |---|---|---|
 | Bar shows | `Today` | Window the per-hour rate is averaged over |
 | Import history from OpenCode | `on` | Backfill exact counts from OpenCode's database |
+| Track Claude Code | `on` | Read Claude Code's exact usage for the Agents view and sessions list |
+| Track Codex | `on` | Read Codex's exact usage for the Agents view and sessions list |
 | Refresh (seconds) | `10` | One loopback request per resident model per refresh |
 | Cloud price per 1M prompt tokens | `3.00` | Set to the API you would otherwise use |
 | Cloud price per 1M generated tokens | `15.00` | |
@@ -226,11 +240,14 @@ on the panel next to the savings figure so the number is never a hidden guess.
 ## Controlling it from a script or a keybinding
 
 ```bash
-omarchy-shell io.github.erikburdett.tokenstats open     # show the panel
+omarchy-shell io.github.erikburdett.tokenstats open      # show the panel
 omarchy-shell io.github.erikburdett.tokenstats close
 omarchy-shell io.github.erikburdett.tokenstats toggle
-omarchy-shell io.github.erikburdett.tokenstats edit     # open it on the Setup pane
-omarchy-shell io.github.erikburdett.tokenstats refresh  # sample now
+omarchy-shell io.github.erikburdett.tokenstats edit      # open it on the Setup pane
+omarchy-shell io.github.erikburdett.tokenstats sessions  # every AI session, searchable
+omarchy-shell io.github.erikburdett.tokenstats agents    # Claude Code / Codex usage and spend
+omarchy-shell io.github.erikburdett.tokenstats graph claude   # or codex, or local
+omarchy-shell io.github.erikburdett.tokenstats refresh   # sample now
 ```
 
 `edit` follows the same convention as Omarchy's own `omarchy-shell
@@ -296,11 +313,34 @@ version 4, understated the prompt side of the cloud comparison by up to 74×.
 
 Generated tokens have no such subtlety and are exact from either source.
 
+### Cloud agents: Claude Code and Codex
+
+Both tools write the API's **own exact usage** to disk — Claude Code per
+assistant message in `~/.claude/projects/*/*.jsonl`, Codex per turn in
+`~/.codex/sessions/**/rollout-*.jsonl` — and `scripts/scan-agents.sh` reads
+those records with `jq`, read-only, behind a per-provider watermark. A
+steady-state scan touches only files modified since the last one, so the
+recurring cost is one short-lived process that usually reads nothing; the
+first scan back-fills everything both tools ever recorded (about half a second
+for 77 MB of history on the machine this was written on).
+
+Duplicate streaming lines in Claude Code's files are deduplicated by message
+id. Codex's per-turn figures come from `last_token_usage`, not the cumulative
+total, so turns are never double-counted. Cache reads are kept apart from
+uncached prompt, exactly as the providers bill them; cache *writes* are folded
+into the prompt figure at the plain input rate, which errs a few percent low.
+
+Agent tokens live in their own state file
+(`~/.local/state/omarchy/tokenstats/agents.json`) and **never** enter the
+local history or the savings figure. The Agents pane prices them per model
+from a table of published rates and labels the result an estimate.
+
 ## Savings
 
 `Net saved` is the cloud cost of the same tokens minus the electricity your
 hardware actually spent generating them. It does not charge notional rent for
-memory or hardware you already own.
+memory or hardware you already own. Tokens your cloud agents consumed are
+never part of this figure — they appear in the Agents pane as spend instead.
 
 ## Live updates
 

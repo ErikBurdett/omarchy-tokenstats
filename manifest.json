@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "io.github.erikburdett.tokenstats",
   "name": "Token Stats",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "author": "Erik Burdett",
   "license": "MIT",
-  "description": "Local LLM tokens per hour in the bar, with an exact-count graph, history and cloud comparison",
+  "description": "Local LLM tokens per hour in the bar, with an exact-count graph, history, cloud comparison, and Claude Code / Codex agent tracking with a unified resumable sessions list",
   "kinds": [
     "bar-widget"
   ],
@@ -14,13 +14,16 @@
   },
   "barWidget": {
     "displayName": "Token Stats",
-    "description": "Tokens per hour in the bar, with a graph, history and savings versus a hosted API",
+    "description": "Tokens per hour in the bar, with a graph, history, savings versus a hosted API, and every AI session — local and cloud — in one resumable list",
     "category": "System",
     "aliases": [
       "tokens",
       "llm",
       "llama",
-      "stats"
+      "stats",
+      "agents",
+      "claude",
+      "codex"
     ],
     "allowMultiple": false,
     "defaultSection": "left",
@@ -34,7 +37,9 @@
       "pricePerKwh": "0.12",
       "currencySymbol": "$",
       "endpoint": "auto",
-      "importOpencode": true
+      "importOpencode": true,
+      "importClaude": true,
+      "importCodex": true
     },
     "schema": [
       {
@@ -116,6 +121,20 @@
         "type": "boolean",
         "label": "Import history from OpenCode",
         "description": "Fills in tokens generated before this widget was installed, or while the shell was not running, using OpenCode's own exact per-reply counts. Read-only, local models only, and never double-counted.",
+        "defaultValue": true
+      },
+      {
+        "key": "importClaude",
+        "type": "boolean",
+        "label": "Track Claude Code",
+        "description": "Reads the exact per-message usage Claude Code records under ~/.claude for the Agents view and the unified sessions list. Read-only, and kept apart from the local savings figure.",
+        "defaultValue": true
+      },
+      {
+        "key": "importCodex",
+        "type": "boolean",
+        "label": "Track Codex",
+        "description": "Reads the exact per-turn usage Codex records under ~/.codex for the Agents view and the unified sessions list. Read-only, and kept apart from the local savings figure.",
         "defaultValue": true
       }
     ]

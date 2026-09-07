@@ -6,6 +6,48 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.5.0] — 2026-09-07
+
+### Added
+
+- **Claude Code and Codex tracking.** Both tools write the API's own exact
+  usage to disk — Claude Code per assistant message under `~/.claude/projects`,
+  Codex per turn in its rollout files — and a new `scripts/scan-agents.sh`
+  reads those records with `jq`, read-only, behind a per-provider watermark.
+  Steady-state scans touch only files changed since the last one. Duplicate
+  streaming lines are deduplicated by message id; Codex turns come from
+  `last_token_usage`, never the cumulative total.
+- **An Agents pane** showing what each cloud agent consumed in the selected
+  window, per model, with estimated spend at published per-1M rates (priced
+  from a table in `TokenModel.js`; cache reads at a tenth of the input rate,
+  cache writes folded into prompt at the plain rate, which errs a few percent
+  low; the locally-run `gpt-oss` family and unknown models are shown as
+  local/unpriced, never billed as cloud). Agent tokens live in their own
+  `agents.json` and are deliberately never mixed into the local history or
+  the savings figure — those tokens were paid for.
+- **A unified sessions list.** The Sessions pane now shows OpenCode, Claude
+  Code and Codex sessions in one list, newest first, each tagged with its
+  source. Clicking a row resumes it with the right tool — `opencode
+  --session`, `claude --resume`, or `codex resume` — in the session's own
+  working directory.
+- **Session search and filtering.** The Sessions pane gained source chips
+  (All / OpenCode / Claude / Codex), a live search box matching title, model,
+  directory and source label as you type, and a visible "N of M" count.
+- **Agent graphs and history.** The Graph and History views gained a source
+  selector (Local / Claude / Codex): pick an agent and the same chart, table
+  and per-model rows read that agent's buckets, with estimated spend in the
+  hero in place of a throughput rate. The savings block stays strictly local
+  — it prices tokens that did not go to a hosted API, so it hides for agent
+  sources rather than showing a meaningless number.
+- IPC verbs to open the panel straight onto a pane, for keybindings:
+  `sessions`, `agents`, and `graph local|claude|codex`.
+- Two settings, `importClaude` and `importCodex` (both default on), in the
+  manifest schema and the widget's Setup pane.
+- A new `preview.png` showing the Claude graph, the Agents pane and the
+  unified sessions list side by side.
+- A tooltip line with what the agents generated in the bar's window, shown
+  only when there is something to say.
+
 ## [1.4.0] — 2026-09-06
 
 ### Fixed

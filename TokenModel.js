@@ -300,7 +300,9 @@ var SETTING_SPECS = {
   systemWatts:                { kind: "int", min: 0, max: 2000 },
   pricePerKwh:                { kind: "money" },
   currencySymbol:             { kind: "text", max: 3 },
-  importOpencode:             { kind: "bool" }
+  importOpencode:             { kind: "bool" },
+  importClaude:               { kind: "bool" },
+  importCodex:                { kind: "bool" }
 }
 
 // The built-in default for every setting, used when neither the panel nor
@@ -317,7 +319,9 @@ var SETTING_DEFAULTS = {
   systemWatts: 120,
   pricePerKwh: "0.12",
   currencySymbol: "$",
-  importOpencode: true
+  importOpencode: true,
+  importClaude: true,
+  importCodex: true
 }
 
 function settingDefault(key) {
@@ -598,6 +602,12 @@ function parseHistory(text) {
   } catch (e) {
     return emptyHistory()
   }
+  return parseHistoryDoc(doc)
+}
+
+// The same validation for a history that arrives as an already-parsed object —
+// each provider entry inside agents.json is one of these.
+function parseHistoryDoc(doc) {
   if (!doc || typeof doc !== "object" || doc.version !== HISTORY_VERSION) return emptyHistory()
 
   var out = emptyHistory()
@@ -1276,6 +1286,270 @@ function shapeTitle(raw) {
   }
 
   return t.charAt(0).toUpperCase() + t.substring(1)
+}
+
+// ---------------------------------------------------------------- agents
+
+// Cloud coding agents — Claude Code and Codex — tracked beside the local
+// counts but never mixed into them: the savings figure above prices tokens
+// you did NOT send to a hosted API, and folding in tokens you actually paid
+// for would corrupt it. Each provider gets its own full history (the same
+// bucket machinery, so totals/series/modelBreakdown all work on it), and the
+// whole set persists as one agents.json.
+//
+// Both sources are exact, read from the tools' own records by
+// scripts/scan-agents.sh: Claude Code stores the API's usage block per
+// assistant message, Codex stores the API's per-turn usage in its
+// token_count events.
+var AGENT_PROVIDERS = ["claude", "codex"]
+
+function emptyAgentHistories() {
+  var out = {}
+  for (var i = 0; i < AGENT_PROVIDERS.length; i++)
+    out[AGENT_PROVIDERS[i]] = emptyHistory()
+  return out
+}
+
+// agents.json is { version: N, providers: { claude: <history>, codex: … } }.
+// Unknown providers are dropped; each provider entry is re-validated by the
+// same parser history.json goes through. HISTORY_VERSION doubles as the file
+// version: the buckets inside are exactly that format.
+function parseAgentHistories(text) {
+  var out = emptyAgentHistories()
+  var raw = String(text === undefined || text === null ? "" : text)
+  if (raw.length === 0 || raw.length > MAX_STATE_BYTES) return out
+  var doc
+  try {
+    doc = JSON.parse(raw)
+  } catch (e) {
+    return out
+  }
+  if (!doc || typeof doc !== "object" || doc.version !== HISTORY_VERSION) return out
+  var src = doc.providers
+  if (!src || typeof src !== "object") return out
+  for (var i = 0; i < AGENT_PROVIDERS.length; i++) {
+    var p = AGENT_PROVIDERS[i]
+    if (src[p]) out[p] = parseHistoryDoc(src[p])
+  }
+  return out
+}
+
+function serializeAgentHistories(histories) {
+  var providers = {}
+  for (var i = 0; i < AGENT_PROVIDERS.length; i++) {
+    var p = AGENT_PROVIDERS[i]
+    providers[p] = (histories && histories[p]) ? histories[p] : emptyHistory()
+  }
+  return JSON.stringify({ version: HISTORY_VERSION, providers: providers })
+}
+
+// One row per API reply from the scan script:
+//   ts_ms|id|model|input|cache_read|cache_write|output
+// input is the uncached prompt; cache_read is prompt served from the
+// provider's cache. cache_write is folded into the prompt figure — it is
+// billed slightly ABOVE the plain input rate (1.25x at the common providers),
+// so the spend estimate errs a few percent low rather than inventing a
+// fourth bucket field.
+function parseAgentRows(text, notBefore) {
+  var raw = String(text === undefined || text === null ? "" : text)
+  if (raw.length === 0 || raw.length > MAX_STATE_BYTES) return []
+
+  var lines = raw.split("\n")
+  var limit = lines.length < 40000 ? lines.length : 40000
+  var floor = isNum(notBefore) ? notBefore : 0
+  var out = []
+
+  for (var i = 0; i < limit; i++) {
+    var f = lines[i].split("|")
+    if (f.length < 7) continue
+
+    var when = parseInt(f[0], 10)
+    if (!isNum(when) || when <= floor) continue
+
+    var input = parseInt(f[3], 10)
+    var cacheRead = parseInt(f[4], 10)
+    var cacheWrite = parseInt(f[5], 10)
+    var output = parseInt(f[6], 10)
+    if (!isNum(output)) continue
+
+    out.push({
+      when: when,
+      model: modelKey(f[2]),
+      promptTokens: clampNonNeg(input, MAX_TOKENS_PER_SAMPLE) +
+                    clampNonNeg(isNum(cacheWrite) ? cacheWrite : 0, MAX_TOKENS_PER_SAMPLE),
+      promptCached: clampNonNeg(isNum(cacheRead) ? cacheRead : 0, MAX_TOKENS_PER_SAMPLE),
+      predictedTokens: clampNonNeg(output, MAX_TOKENS_PER_SAMPLE),
+      predictedSeconds: 0
+    })
+  }
+  return out
+}
+
+// Fold agent rows in behind a single per-provider watermark. Unlike the local
+// import there is no live source racing this one, so the watermark is simply
+// the newest row ever recorded: rows at or before it were counted, everything
+// after is new. The scan script deduplicates by message id within a scan, and
+// the strict > here keeps a row from being counted twice across scans.
+//
+// The watermark advances only to the newest row actually seen — never to the
+// scan instant — so a row that lands on disk after the scan read its file is
+// picked up next time rather than skipped.
+function applyAgentImport(history, rows) {
+  var newest = 0
+  var taken = 0
+  if (!history) return { newest: newest, taken: taken }
+  var floor = clampNonNeg(history.importedThrough, Number.MAX_SAFE_INTEGER)
+  for (var i = 0; i < rows.length; i++) {
+    var row = rows[i]
+    if (row.when <= floor) continue
+    if (row.predictedTokens <= 0 && row.promptTokens <= 0 && row.promptCached <= 0) continue
+    record(history, row, new Date(row.when), 1, false, row.model)
+    taken++
+    if (row.when > newest) newest = row.when
+  }
+  if (newest > floor) history.importedThrough = newest
+  return { newest: newest, taken: taken }
+}
+
+// Published per-1M rates for the models these agents actually run, matched by
+// prefix so a dated or suffixed id still prices. Cached prompt reads are a
+// tenth of the input rate at both providers. These are stated assumptions the
+// panel labels as estimates — rates move, and this table is where they live.
+// (Anthropic and OpenAI list prices as of September 2026.)
+var AGENT_PRICES = [
+  { prefix: "claude-fable",  input: 10,   output: 50 },
+  { prefix: "claude-mythos", input: 10,   output: 50 },
+  { prefix: "claude-opus",   input: 5,    output: 25 },
+  { prefix: "claude-sonnet-5", input: 2,  output: 10 },
+  { prefix: "claude-sonnet", input: 3,    output: 15 },
+  { prefix: "claude-haiku",  input: 1,    output: 5 },
+  { prefix: "claude",        input: 5,    output: 25 },
+  // gpt-oss is the open-weights family Codex runs LOCALLY through its oss
+  // provider. It must sort before the gpt catch-all: pricing a local model as
+  // cloud spend is exactly the kind of quiet lie this plugin exists to avoid.
+  { prefix: "gpt-oss",       input: null, output: null },
+  { prefix: "gpt-6",         input: 10,   output: 50 },
+  { prefix: "gpt-5.6",       input: 4,    output: 20 },
+  { prefix: "gpt-5",         input: 1.25, output: 10 },
+  { prefix: "gpt",           input: 4,    output: 20 },
+  { prefix: "codex",         input: 4,    output: 20 }
+]
+
+function agentPrice(model) {
+  var id = String(model === undefined || model === null ? "" : model).toLowerCase()
+  for (var i = 0; i < AGENT_PRICES.length; i++) {
+    if (id.indexOf(AGENT_PRICES[i].prefix) === 0) {
+      if (!isNum(AGENT_PRICES[i].input)) return null
+      return { input: AGENT_PRICES[i].input,
+               cachedInput: AGENT_PRICES[i].input / 10,
+               output: AGENT_PRICES[i].output }
+    }
+  }
+  return null
+}
+
+// Estimated spend for one totals bucket, priced per model from the table.
+// Tokens whose model has no listed price are counted but not priced, and the
+// unpriced generated-token count is reported so the panel can say so instead
+// of showing a silently short figure.
+function agentSpend(bucket) {
+  var spend = 0
+  var unpriced = 0
+  var src = (bucket && bucket.byModel) || {}
+  for (var key in src) {
+    var price = agentPrice(key)
+    if (!price) { unpriced += src[key].c; continue }
+    spend += (src[key].p / 1000000) * price.input
+           + (clampNonNeg(src[key].pc, Number.MAX_SAFE_INTEGER) / 1000000) * price.cachedInput
+           + (src[key].c / 1000000) * price.output
+  }
+  return { spend: spend, unpriced: unpriced }
+}
+
+// One row per agent session from the scan script, same columns as OpenCode's:
+//   id|title|output_tokens|model|directory|updated_ms
+// Ids are UUIDs (both tools) and are handed to a launcher, so they are
+// pattern-validated, not repaired.
+var UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
+
+function parseAgentSessions(text, source) {
+  var raw = String(text === undefined || text === null ? "" : text)
+  if (raw.length === 0 || raw.length > MAX_STATE_BYTES) return []
+
+  var lines = raw.split("\n")
+  var limit = lines.length < 500 ? lines.length : 500
+  var out = []
+
+  for (var i = 0; i < limit && out.length < MAX_SESSIONS; i++) {
+    var f = lines[i].split("|")
+    if (f.length < 6) continue
+    if (!UUID_RE.test(f[0])) continue
+
+    var tokens = parseInt(f[2], 10)
+    var when = parseInt(f[5], 10)
+    if (!isNum(tokens) || tokens <= 0) continue
+
+    out.push({
+      id: f[0],
+      title: cleanTitle(f[1], ""),
+      tokens: clampNonNeg(tokens, Number.MAX_SAFE_INTEGER),
+      model: modelKey(f[3]),
+      directory: String(f[4] || "").substring(0, 240),
+      at: isNum(when) ? when : 0,
+      source: source === "codex" ? "codex" : "claude"
+    })
+  }
+  return out
+}
+
+// Every source's sessions in one list, newest first, bounded. Each entry
+// carries its `source` so the panel can tag it and the launcher can pick the
+// right binary.
+function mergeSessions(lists) {
+  var out = []
+  var src = Array.isArray(lists) ? lists : []
+  for (var i = 0; i < src.length; i++) {
+    var list = Array.isArray(src[i]) ? src[i] : []
+    for (var j = 0; j < list.length && out.length < MAX_SESSIONS * 3; j++) out.push(list[j])
+  }
+  out.sort(function (a, b) { return (b.at || 0) - (a.at || 0) })
+  return out.slice(0, MAX_SESSIONS)
+}
+
+// Narrow the merged list to one source and/or a search string. The query is a
+// plain case-insensitive substring over what the row actually shows — title,
+// model, directory and the source label — because a search box that matches
+// hidden fields reads as broken. Pure and bounded so the view stays
+// declarative: the panel just binds to the result.
+function filterSessions(sessions, source, query) {
+  var list = Array.isArray(sessions) ? sessions : []
+  var src = String(source === undefined || source === null ? "all" : source)
+  var q = String(query === undefined || query === null ? "" : query).trim().toLowerCase()
+  if (q.length > 80) q = q.substring(0, 80)
+
+  var out = []
+  for (var i = 0; i < list.length && out.length < MAX_SESSIONS; i++) {
+    var s = list[i]
+    if (!s || typeof s !== "object") continue
+    var rowSource = String(s.source || "opencode")
+    if (src !== "all" && rowSource !== src) continue
+    if (q !== "") {
+      var hay = (String(s.title || "") + " " + String(s.model || "") + " "
+                 + String(s.directory || "") + " " + sourceLabel(s.source)).toLowerCase()
+      if (hay.indexOf(q) === -1) continue
+    }
+    out.push(s)
+  }
+  return out
+}
+
+// The label a session row shows for where it ran.
+function sourceLabel(source) {
+  switch (String(source || "")) {
+    case "claude": return "Claude"
+    case "codex":  return "Codex"
+    default:       return "OpenCode"
+  }
 }
 
 // Compact "when", for list rows: a time today, a day and month otherwise.

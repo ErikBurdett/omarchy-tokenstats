@@ -39,10 +39,14 @@ Panel {
   property var overrides: ({})
   property var shellSettings: ({})
 
-  // Everything that is a statistic rather than a list or a form. Sessions and
-  // Setup replace the whole body; the graph, table, per-model rows and cost
-  // block all belong to the same "show me the numbers" mode.
-  readonly property bool statsView: view !== "sessions" && view !== "setup"
+  // Per-provider histories for the cloud coding agents, injected by the
+  // widget. Same bucket format as `history`, so the same Model queries work.
+  property var agentHistories: null
+
+  // Everything that is a statistic rather than a list or a form. Sessions,
+  // Agents and Setup replace the whole body; the graph, table, per-model rows
+  // and cost block all belong to the same "show me the numbers" mode.
+  readonly property bool statsView: view !== "sessions" && view !== "setup" && view !== "agents"
 
   // Effective value for a setting: panel override, else shell.json, else the
   // built-in default. Mirrors the widget's own setting() resolution.
@@ -65,6 +69,22 @@ Panel {
     view = "setup"
   }
 
+  function showSessions() {
+    view = "sessions"
+  }
+
+  function showAgents() {
+    view = "agents"
+  }
+
+  // `source` comes over IPC, so it is checked against the three known values
+  // rather than assigned; anything else lands on the local graph.
+  function showGraph(source) {
+    var key = String(source || "").toLowerCase()
+    chartSource = (key === "claude" || key === "codex") ? key : "local"
+    view = "graph"
+  }
+
   function writeSetting(key, value) {
     if (hostWidget && typeof hostWidget.setOverride === "function") hostWidget.setOverride(key, value)
   }
@@ -72,6 +92,11 @@ Panel {
   property string period: "day"
   property string view: "graph"
   property var sessions: []
+  // Sessions pane filter state: a source chip (all/opencode/claude/codex) and
+  // a live search string. The list the pane shows is always the filtered one.
+  property string sessionQuery: ""
+  property string sessionSource: "all"
+  readonly property var filteredSessions: Model.filterSessions(sessions, sessionSource, sessionQuery)
   // -1 when nothing is under the pointer.
   property int hoverIndex: -1
   // Pointer position inside the chart, for placing the floating readout.
@@ -91,10 +116,40 @@ Panel {
     triggeredOnStart: true
     onTriggered: root.now = new Date()
   }
-  readonly property var totals: Model.totals(history, period, now)
-  readonly property var points: Model.series(history, period, now)
-  readonly property var money: Model.savings(totals, rates)
+  // Which history the graph, table, hero and per-model rows read: the local
+  // one, or a cloud agent's. Everything money-shaped stays LOCAL regardless —
+  // savings can only mean anything for tokens that did not go to a hosted
+  // API; an agent source gets a spend estimate in the hero instead.
+  property string chartSource: "local"
+  readonly property var shownHistory: (statsView && chartSource !== "local"
+                                       && agentHistories && agentHistories[chartSource])
+                                      ? agentHistories[chartSource] : history
+  readonly property var localTotals: Model.totals(history, period, now)
+  readonly property var totals: Model.totals(shownHistory, period, now)
+  readonly property var points: Model.series(shownHistory, period, now)
+  readonly property var money: Model.savings(localTotals, rates)
   readonly property var byModel: Model.modelBreakdown(totals)
+
+  // One block per cloud agent with anything recorded in the window: totals,
+  // estimated spend at published per-model rates, and the per-model split.
+  readonly property var agentBlocks: {
+    var out = []
+    var providers = [["claude", "Claude Code"], ["codex", "Codex"]]
+    for (var i = 0; i < providers.length; i++) {
+      var h = agentHistories ? agentHistories[providers[i][0]] : null
+      if (!h) continue
+      var t = Model.totals(h, period, now)
+      if (t.c <= 0 && t.p <= 0 && t.pc <= 0) continue
+      out.push({
+        key: providers[i][0],
+        name: providers[i][1],
+        totals: t,
+        spend: Model.agentSpend(t),
+        models: Model.modelBreakdown(t)
+      })
+    }
+    return out
+  }
   readonly property real peak: {
     var max = 0
     for (var i = 0; i < points.length; i++) if (points[i].tokens > max) max = points[i].tokens
@@ -142,6 +197,13 @@ Panel {
           // time, so say what the rate was measured on rather than implying it
           // covers everything above it.
           detail: {
+            // An agent source has exact tokens but no meaningful rate, and
+            // its money figure is spend, not savings.
+            if (root.statsView && root.chartSource !== "local") {
+              var spent = Model.agentSpend(root.totals)
+              return Model.periodLabel(root.period) + " · " + Model.sourceLabel(root.chartSource)
+                     + " · ~" + Model.formatMoney(spent.spend, root.currencySymbol) + " spent"
+            }
             var rate = Model.formatRate(root.totals.m, root.totals.s)
             if (root.totals.m <= 0) return Model.periodLabel(root.period) + " · rate not sampled yet"
             if (root.totals.m < root.totals.c * 0.95)
@@ -191,13 +253,24 @@ Panel {
           }
 
           Button {
+            text: "Agents"
+            selected: root.view === "agents"
+            bordered: true
+            foreground: root.barForeground
+            fontFamily: root.fontFamily
+            fontSize: Style.font.caption
+            tooltipText: "Claude Code and Codex usage, with estimated spend at published rates"
+            onClicked: root.view = "agents"
+          }
+
+          Button {
             text: "Sessions"
             selected: root.view === "sessions"
             bordered: true
             foreground: root.barForeground
             fontFamily: root.fontFamily
             fontSize: Style.font.caption
-            tooltipText: "OpenCode sessions by tokens generated. Click one to resume it."
+            tooltipText: "Every AI session — OpenCode, Claude Code and Codex. Click one to resume it."
             onClicked: root.view = "sessions"
           }
 
@@ -211,6 +284,22 @@ Panel {
             tooltipText: "Change what the bar shows and the rates the comparison assumes"
             onClicked: root.view = "setup"
           }
+        }
+
+        // ---- Which history the graph, table and per-model rows read. Local
+        //      is the default; picking an agent turns the same views into
+        //      that agent's graph and history, with spend in the hero instead
+        //      of a rate. The savings block below only ever prices local.
+        ButtonGroup {
+          width: parent.width
+          visible: root.statsView
+          options: ["Local", "Claude", "Codex"]
+          value: root.chartSourceOption(root.chartSource)
+          foreground: root.barForeground
+          background: root.bar ? root.bar.background : Color.background
+          fontFamily: root.fontFamily
+          fontSize: Style.font.caption
+          onChanged: function(v) { root.chartSource = root.optionChartSource(v) }
         }
 
         // A bar chart with no stated scale is decoration: every window looks
@@ -445,17 +534,23 @@ Panel {
           }
         }
 
-        // ---- Sessions. Click one to resume it in a terminal.
+        // ---- Agents. What the cloud coding agents consumed in the same
+        //      window, priced per model at published rates. Deliberately kept
+        //      apart from the local numbers above: these tokens were paid
+        //      for, and folding them into the savings figure would corrupt it.
         Item {
           width: parent.width
           height: Style.space(150)
-          visible: root.view === "sessions"
+          visible: root.view === "agents"
 
           Text {
             anchors.centerIn: parent
-            visible: root.sessions.length === 0
+            width: parent.width
+            horizontalAlignment: Text.AlignHCenter
+            wrapMode: Text.WordWrap
+            visible: root.agentBlocks.length === 0
             textFormat: Text.PlainText
-            text: "No OpenCode sessions with generated tokens yet"
+            text: "No Claude Code or Codex usage recorded in this window yet"
             color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
@@ -464,18 +559,213 @@ Panel {
           Flickable {
             anchors.fill: parent
             contentWidth: width
-            contentHeight: sessionRows.implicitHeight
+            contentHeight: agentRows.implicitHeight
             clip: true
             boundsBehavior: Flickable.StopAtBounds
             interactive: contentHeight > height
 
             Column {
-              id: sessionRows
+              id: agentRows
               width: parent.width
-              spacing: Style.space(2)
+              spacing: Style.space(6)
 
               Repeater {
-                model: root.sessions
+                model: root.agentBlocks
+
+                Column {
+                  id: agentBlock
+                  required property var modelData
+                  width: agentRows.width
+                  spacing: Style.space(1)
+
+                  Row {
+                    width: parent.width
+
+                    Text {
+                      width: parent.width * 0.5
+                      textFormat: Text.PlainText
+                      text: agentBlock.modelData.name
+                      color: root.barForeground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.bodySmall
+                      font.bold: true
+                    }
+
+                    Text {
+                      width: parent.width * 0.5
+                      horizontalAlignment: Text.AlignRight
+                      textFormat: Text.PlainText
+                      text: "~" + Model.formatMoney(agentBlock.modelData.spend.spend, root.currencySymbol) + " spent"
+                      color: root.barForeground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.bodySmall
+                    }
+                  }
+
+                  Text {
+                    width: parent.width
+                    elide: Text.ElideRight
+                    textFormat: Text.PlainText
+                    text: Model.formatTokens(agentBlock.modelData.totals.c) + " generated · "
+                          + Model.formatTokens(agentBlock.modelData.totals.p) + " prompt · "
+                          + Model.formatTokens(agentBlock.modelData.totals.pc) + " from cache ("
+                          + Math.round(Model.cacheHitPercent(agentBlock.modelData.totals)) + "%)"
+                          + (agentBlock.modelData.spend.unpriced > 0
+                             ? " · " + Model.formatTokens(agentBlock.modelData.spend.unpriced) + " local/unpriced"
+                             : "")
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+
+                  Repeater {
+                    model: agentBlock.modelData.models
+
+                    Row {
+                      id: agentModelRow
+                      required property var modelData
+                      width: agentBlock.width
+
+                      Text {
+                        width: parent.width * 0.55
+                        elide: Text.ElideRight
+                        textFormat: Text.PlainText
+                        text: agentModelRow.modelData.model
+                        color: root.dim
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                      }
+
+                      Text {
+                        width: parent.width * 0.30
+                        horizontalAlignment: Text.AlignRight
+                        textFormat: Text.PlainText
+                        text: Model.formatTokens(agentModelRow.modelData.tokens)
+                        color: root.dim
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                      }
+
+                      Text {
+                        width: parent.width * 0.15
+                        horizontalAlignment: Text.AlignRight
+                        textFormat: Text.PlainText
+                        text: Math.round(agentModelRow.modelData.share) + "%"
+                        color: root.dim
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                      }
+                    }
+                  }
+                }
+              }
+
+              // The local side of the same window, so the comparison the
+              // whole plugin exists for is readable in one place.
+              Text {
+                width: agentRows.width
+                visible: root.agentBlocks.length > 0
+                wrapMode: Text.WordWrap
+                textFormat: Text.PlainText
+                text: "Local models: " + Model.formatTokens(root.localTotals.c) + " generated for "
+                      + Model.formatMoney(root.money.local, root.currencySymbol)
+                      + " of electricity in the same window. Spend figures are estimates at published per-1M rates."
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+            }
+          }
+        }
+
+        // ---- Sessions. Filterable by source, searchable as you type, and
+        //      click one to resume it in a terminal. The filtering itself is
+        //      Model.filterSessions, so the view just binds to the result.
+        Item {
+          width: parent.width
+          height: Style.space(200)
+          visible: root.view === "sessions"
+
+          Column {
+            id: sessionsLayout
+            anchors.fill: parent
+            spacing: Style.space(6)
+
+            ButtonGroup {
+              id: sourceChips
+              width: parent.width
+              options: ["All", "OpenCode", "Claude", "Codex"]
+              value: root.sourceOption(root.sessionSource)
+              foreground: root.barForeground
+              background: root.bar ? root.bar.background : Color.background
+              fontFamily: root.fontFamily
+              fontSize: Style.font.caption
+              onChanged: function(v) { root.sessionSource = root.optionSource(v) }
+            }
+
+            Row {
+              width: parent.width
+              spacing: Style.space(6)
+
+              TextField {
+                id: sessionSearch
+                width: parent.width * 0.72
+                foreground: root.barForeground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                verticalPadding: Style.space(3)
+                placeholderText: "Search title, model or directory"
+                // onTextEdited fires only for user edits, so filtering is
+                // live per keystroke without a binding loop.
+                onTextEdited: root.sessionQuery = text
+              }
+
+              Text {
+                width: parent.width * 0.28 - Style.space(6)
+                anchors.verticalCenter: parent.verticalCenter
+                horizontalAlignment: Text.AlignRight
+                textFormat: Text.PlainText
+                text: root.filteredSessions.length === root.sessions.length
+                      ? root.sessions.length + " sessions"
+                      : root.filteredSessions.length + " of " + root.sessions.length
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+            }
+
+            Item {
+              width: parent.width
+              height: sessionsLayout.height - sourceChips.height
+                      - sessionSearch.height - Style.space(12)
+
+              Text {
+                anchors.centerIn: parent
+                visible: root.filteredSessions.length === 0
+                textFormat: Text.PlainText
+                text: root.sessions.length === 0
+                      ? "No AI sessions with generated tokens yet"
+                      : "No sessions match"
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+
+              Flickable {
+                anchors.fill: parent
+                contentWidth: width
+                contentHeight: sessionRows.implicitHeight
+                clip: true
+                boundsBehavior: Flickable.StopAtBounds
+                interactive: contentHeight > height
+
+                Column {
+                  id: sessionRows
+                  width: parent.width
+                  spacing: Style.space(2)
+
+                  Repeater {
+                    model: root.filteredSessions
 
                 Item {
                   id: sessionRow
@@ -513,7 +803,8 @@ Panel {
                     anchors.right: parent.right
                     elide: Text.ElideRight
                     textFormat: Text.PlainText
-                    text: Model.formatTokens(sessionRow.modelData.tokens) + " tokens"
+                    text: Model.sourceLabel(sessionRow.modelData.source)
+                          + "  ·  " + Model.formatTokens(sessionRow.modelData.tokens) + " tokens"
                           + (sessionRow.modelData.model !== "" ? "  ·  " + sessionRow.modelData.model : "")
                           + "  ·  " + Model.shortWhen(sessionRow.modelData.at)
                           + (sessionRow.hovered ? "  ·  click to resume" : "")
@@ -528,13 +819,16 @@ Panel {
                     hoverEnabled: true
                     cursorShape: Qt.PointingHandCursor
                     onClicked: {
-                      if (root.hostWidget && root.hostWidget.openSession)
-                        root.hostWidget.openSession(sessionRow.modelData.id,
-                                                    sessionRow.modelData.directory)
+                      if (root.hostWidget && root.hostWidget.openAgentSession)
+                        root.hostWidget.openAgentSession(sessionRow.modelData.source,
+                                                         sessionRow.modelData.id,
+                                                         sessionRow.modelData.directory)
                     }
                   }
                 }
               }
+            }
+          }
             }
           }
         }
@@ -729,6 +1023,26 @@ Panel {
                 onClicked: root.writeSetting("importOpencode", !checked)
               }
 
+              Toggle {
+                width: parent.width
+                label: "Track Claude Code"
+                description: "Reads the exact usage Claude Code records under ~/.claude for the Agents view and the sessions list. Read-only."
+                checked: root.settingValue("importClaude") === true
+                foreground: root.barForeground
+                fontFamily: root.fontFamily
+                onClicked: root.writeSetting("importClaude", !checked)
+              }
+
+              Toggle {
+                width: parent.width
+                label: "Track Codex"
+                description: "Reads the exact usage Codex records under ~/.codex for the Agents view and the sessions list. Read-only."
+                checked: root.settingValue("importCodex") === true
+                foreground: root.barForeground
+                fontFamily: root.fontFamily
+                onClicked: root.writeSetting("importCodex", !checked)
+              }
+
               PanelSeparator { width: parent.width }
 
               Row {
@@ -837,14 +1151,14 @@ Panel {
         PanelSeparator {
           width: parent.width
           foreground: root.barForeground
-          visible: root.statsView
+          visible: root.statsView && root.chartSource === "local"
         }
 
         PanelSectionHeader {
           text: "Versus a hosted API"
           foreground: root.barForeground
           fontFamily: root.fontFamily
-          visible: root.statsView
+          visible: root.statsView && root.chartSource === "local"
         }
 
         Repeater {
@@ -868,7 +1182,7 @@ Panel {
             required property var modelData
             required property int index
             width: content.width
-            visible: root.statsView
+            visible: root.statsView && root.chartSource === "local"
 
             Text {
               width: parent.width * 0.55
@@ -897,7 +1211,7 @@ Panel {
         Text {
           width: parent.width
           wrapMode: Text.WordWrap
-          visible: root.statsView
+          visible: root.statsView && root.chartSource === "local"
           textFormat: Text.PlainText
           text: "Assumes " + root.currencySymbol + (root.rates.inputPerMillion || 0) + " prompt / "
                 + root.currencySymbol + (root.rates.cachedInputPerMillion || 0) + " cached prompt / "
@@ -958,6 +1272,41 @@ Panel {
       case "Year":  return "year"
       case "All":   return "all"
       default:      return "day"
+    }
+  }
+
+  // Same translate-at-the-edge pattern for the sessions source chips.
+  function sourceOption(key) {
+    switch (String(key)) {
+      case "opencode": return "OpenCode"
+      case "claude":   return "Claude"
+      case "codex":    return "Codex"
+      default:         return "All"
+    }
+  }
+
+  function optionSource(option) {
+    switch (String(option)) {
+      case "OpenCode": return "opencode"
+      case "Claude":   return "claude"
+      case "Codex":    return "codex"
+      default:         return "all"
+    }
+  }
+
+  function chartSourceOption(key) {
+    switch (String(key)) {
+      case "claude": return "Claude"
+      case "codex":  return "Codex"
+      default:       return "Local"
+    }
+  }
+
+  function optionChartSource(option) {
+    switch (String(option)) {
+      case "Claude": return "claude"
+      case "Codex":  return "codex"
+      default:       return "local"
     }
   }
 }

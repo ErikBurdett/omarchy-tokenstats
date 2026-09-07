@@ -18,7 +18,10 @@ new Function("exports", src + `;Object.assign(exports,{
   settingDefault, SETTING_DEFAULTS, SETTING_SPECS,
   detectServerShape, directModelName, shortModelName, endpointSetting,
   isLoopbackEndpoint, isLoopbackBaseUrl, parseLocalProviders, providerFilterSql,
-  ENDPOINT_CANDIDATES });`)(M)
+  ENDPOINT_CANDIDATES,
+  emptyAgentHistories, parseAgentHistories, serializeAgentHistories,
+  parseAgentRows, applyAgentImport, agentPrice, agentSpend,
+  parseAgentSessions, mergeSessions, sourceLabel, filterSessions, AGENT_PROVIDERS });`)(M)
 
 let fails = 0
 const check = (name, actual, expected) => {
@@ -504,6 +507,108 @@ check("truncates on a word boundary",
 check("empty becomes untitled", M.cleanTitle("   ", "  "), "(untitled)")
 check("null safe", M.cleanTitle(null, null), "(untitled)")
 check("length capped", M.cleanTitle("y".repeat(200), "").length <= 60, true)
+
+console.log("agent usage rows")
+// ts|id|model|input|cache_read|cache_write|output — exact counts from the
+// tools' own records, one row per API reply.
+const AROWS = [
+  "1788757901000|msg_a|claude-fable-5|2|0|39705|820",
+  "1788757910000|msg_b|claude-fable-5|2|39705|7025|796",
+  "junk",
+  "1788757911000|msg_c|claude-fable-5|2|1",
+].join("\n")
+const arows = M.parseAgentRows(AROWS, 0)
+check("valid rows only", arows.length, 2)
+check("cache write folds into prompt", arows[0].promptTokens, 2 + 39705)
+check("cache read kept apart", arows[1].promptCached, 39705)
+check("agent rows carry no seconds", arows[0].predictedSeconds, 0)
+check("watermark excludes older", M.parseAgentRows(AROWS, 1788757901000).length, 1)
+check("empty input", M.parseAgentRows("", 0), [])
+
+console.log("agent import watermark")
+let ah = M.emptyHistory()
+const ares = M.applyAgentImport(ah, arows)
+check("rows taken", ares.taken, 2)
+check("newest returned", ares.newest, 1788757910000)
+check("watermark advances to newest row", ah.importedThrough, 1788757910000)
+check("imported unmetered", M.totals(ah, "all", new Date(1788757910000)).m, 0)
+check("second pass takes nothing", M.applyAgentImport(ah, arows).taken, 0)
+check("model attributed",
+      M.modelBreakdown(M.totals(ah, "all", new Date(1788757910000)))[0].model, "claude-fable-5")
+
+console.log("agent histories persistence")
+let ahs = M.emptyAgentHistories()
+check("one history per provider", Object.keys(ahs).sort(), ["claude", "codex"])
+M.applyAgentImport(ahs.claude, arows)
+const ahsRound = M.parseAgentHistories(M.serializeAgentHistories(ahs))
+check("claude survives round trip",
+      M.totals(ahsRound.claude, "all", new Date(1788757910000)).c, 820 + 796)
+check("watermark survives round trip", ahsRound.claude.importedThrough, 1788757910000)
+check("codex untouched stays empty", M.totals(ahsRound.codex, "all", new Date()).c, 0)
+check("garbage is empty, not a throw",
+      M.totals(M.parseAgentHistories("{{{").claude, "all", new Date()).c, 0)
+check("unknown provider dropped",
+      M.parseAgentHistories('{"version":4,"providers":{"evil":{"version":4,"days":{}}}}').evil, undefined)
+
+console.log("agent pricing")
+check("fable priced", M.agentPrice("claude-fable-5"), { input: 10, cachedInput: 1, output: 50 })
+check("opus priced", M.agentPrice("claude-opus-5").output, 25)
+check("sonnet 5 cheaper than 4.6", M.agentPrice("claude-sonnet-5").input < M.agentPrice("claude-sonnet-4-6").input, true)
+check("astra priced", M.agentPrice("gpt-6-astra"), { input: 10, cachedInput: 1, output: 50 })
+check("sol priced", M.agentPrice("gpt-5.6-sol").input, 4)
+check("unknown model unpriced", M.agentPrice("mystery-9000"), null)
+// Codex runs the open-weights gpt-oss family LOCALLY through its oss
+// provider; those tokens cost nothing and must not be billed as cloud.
+check("gpt-oss is local, never priced as cloud", M.agentPrice("gpt-oss20b"), null)
+
+let sh2 = M.emptyHistory()
+M.record(sh2, { promptTokens: 1000000, promptCached: 1000000, predictedTokens: 1000000, predictedSeconds: 0 },
+         new Date(2026, 8, 6, 9, 0), 1, false, "claude-opus-5")
+M.record(sh2, { promptTokens: 0, promptCached: 0, predictedTokens: 500000, predictedSeconds: 0 },
+         new Date(2026, 8, 6, 9, 0), 1, false, "mystery-9000")
+const spent = M.agentSpend(M.totals(sh2, "day", new Date(2026, 8, 6, 10, 0)))
+check("spend prices input, cached and output", Number(spent.spend.toFixed(2)), 5 + 0.5 + 25)
+check("unpriced tokens reported, not silently dropped", spent.unpriced, 500000)
+
+console.log("agent sessions")
+const ASESS = [
+  "f243b8b5-430b-457f-9258-b7d5dd259814|Fix the parser|5000|claude-fable-5|/home/x|1788757901000",
+  "not-a-uuid|title|100|m|/d|1",
+  "f243b8b5-430b-457f-9258-b7d5dd259815|zero tokens|0|m|/d|1"
+].join("\n")
+const asess = M.parseAgentSessions(ASESS, "claude")
+check("valid agent sessions only", asess.length, 1)
+check("source tagged", asess[0].source, "claude")
+check("codex source tagged", M.parseAgentSessions(ASESS, "codex")[0].source, "codex")
+check("uuid preserved", asess[0].id, "f243b8b5-430b-457f-9258-b7d5dd259814")
+check("agent session title shaped", asess[0].title, "Fix the parser")
+
+const merged = M.mergeSessions([
+  [{ id: "a", at: 100 }], [{ id: "b", at: 300, source: "codex" }], [{ id: "c", at: 200 }]
+])
+check("merged newest first", merged.map(s => s.id), ["b", "c", "a"])
+check("merge caps the list",
+      M.mergeSessions([Array.from({ length: 300 }, (_, i) => ({ id: String(i), at: i }))]).length <= 100, true)
+check("source labels", [M.sourceLabel("claude"), M.sourceLabel("codex"), M.sourceLabel(undefined)],
+      ["Claude", "Codex", "OpenCode"])
+
+console.log("session filtering")
+const FSESS = [
+  { id: "a", title: "Fix the parser", model: "claude-fable-5", directory: "/home/x/proj", source: "claude", at: 3 },
+  { id: "b", title: "Build a dock", model: "gpt-6-astra", directory: "/home/x/dock", source: "codex", at: 2 },
+  { id: "c", title: "Wallpaper pass", model: "qwen3", directory: "/home/x/art", at: 1 }
+]
+check("no filter keeps everything", M.filterSessions(FSESS, "all", "").length, 3)
+check("source filter", M.filterSessions(FSESS, "codex", "").map(s => s.id), ["b"])
+check("missing source counts as opencode", M.filterSessions(FSESS, "opencode", "").map(s => s.id), ["c"])
+check("query matches title", M.filterSessions(FSESS, "all", "parser").map(s => s.id), ["a"])
+check("query is case-insensitive", M.filterSessions(FSESS, "all", "PARSER").map(s => s.id), ["a"])
+check("query matches model", M.filterSessions(FSESS, "all", "astra").map(s => s.id), ["b"])
+check("query matches directory", M.filterSessions(FSESS, "all", "/art").map(s => s.id), ["c"])
+check("query matches the source label", M.filterSessions(FSESS, "all", "opencode").map(s => s.id), ["c"])
+check("source and query combine", M.filterSessions(FSESS, "claude", "dock").length, 0)
+check("no match is empty", M.filterSessions(FSESS, "all", "zzz"), [])
+check("garbage input is empty, not a throw", M.filterSessions("nope", "all", "x"), [])
 
 console.log("")
 if (fails) { console.log(`${fails} test(s) failed`); process.exit(1) }

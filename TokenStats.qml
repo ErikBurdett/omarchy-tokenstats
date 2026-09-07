@@ -76,6 +76,8 @@ BarWidget {
   readonly property real pricePerKwh: Math.min(Math.max(Number(setting("pricePerKwh", 0.12)), 0), 10)
   readonly property string currencySymbol: String(setting("currencySymbol", "$")).substring(0, 3)
   readonly property bool importOpencode: setting("importOpencode", true) === true
+  readonly property bool importClaude: setting("importClaude", true) === true
+  readonly property bool importCodex: setting("importCodex", true) === true
 
   // XDG, not a hardcoded ~/.local. A machine that sets XDG_DATA_HOME or
   // XDG_CONFIG_HOME keeps OpenCode somewhere else entirely, and assuming
@@ -88,6 +90,14 @@ BarWidget {
                                       : Quickshell.env("HOME") + "/.config"
   readonly property string opencodeDb: xdgData + "/opencode/opencode.db"
   readonly property string opencodeConfig: xdgConfig + "/opencode/opencode.json"
+
+  // The scan script ships beside this file, so its path is resolved from the
+  // QML file's own location rather than a hardcoded install path — the plugin
+  // works from wherever it was actually installed.
+  readonly property string scanScript: {
+    var url = Qt.resolvedUrl("scripts/scan-agents.sh").toString()
+    return url.indexOf("file://") === 0 ? decodeURIComponent(url.substring(7)) : url
+  }
 
   // Provider ids that opencode.json says point at loopback — i.e. the ones
   // actually running on this machine. Empty until the config is read.
@@ -216,7 +226,7 @@ BarWidget {
   }
 
   function reapAll() {
-    var procs = [pollProc, importProc, sessionsProc]
+    var procs = [pollProc, importProc, sessionsProc, agentScanProc, agentSessionsProc]
     for (var i = 0; i < procs.length; i++) {
       if (!procs[i].running) continue
       procs[i].signal(9)
@@ -358,6 +368,7 @@ BarWidget {
     opencodeConfigFile.reload()
     overridesFile.reload()
     historyFile.reload()
+    agentsFile.reload()
     refresh()
   }
 
@@ -473,12 +484,14 @@ BarWidget {
     pollWatchdog.stop()
     importWatchdog.stop()
     sessionsWatchdog.stop()
+    agentScanWatchdog.stop()
+    agentSessionsWatchdog.stop()
     launchWatchdog.stop()
     reapTimer.stop()
     // No grace period here: the component is going away and there will be no
     // timer left to escalate from, so TERM and KILL are sent together rather
     // than leaving a reader behind.
-    var procs = [pollProc, importProc, sessionsProc]
+    var procs = [pollProc, importProc, sessionsProc, agentScanProc, agentSessionsProc]
     for (var i = 0; i < procs.length; i++) {
       if (!procs[i].running) continue
       procs[i].signal(15)
@@ -486,6 +499,7 @@ BarWidget {
       procs[i].running = false
     }
     if (root.historyDirty) root.saveHistory()
+    if (root.agentsDirty) root.saveAgents()
   }
 
   // ---------------------------------------------------------------- memory
@@ -564,7 +578,10 @@ BarWidget {
     interval: 60000
     running: true
     repeat: true
-    onTriggered: if (root.historyDirty) root.saveHistory()
+    onTriggered: {
+      if (root.historyDirty) root.saveHistory()
+      if (root.agentsDirty) root.saveAgents()
+    }
   }
 
   // ---------------------------------------------------------------- import
@@ -730,6 +747,221 @@ BarWidget {
     onTriggered: root.stopProcess(sessionsProc)
   }
 
+  // ---------------------------------------------------------------- agents
+
+  // Claude Code and Codex tracked beside the local counts, never mixed into
+  // them: the savings figure prices tokens that did NOT go to a hosted API,
+  // and tokens you actually paid for must not inflate it. Both tools write
+  // the API's own exact usage to disk — Claude Code per assistant message
+  // under ~/.claude/projects, Codex per turn in its rollout files — and
+  // scripts/scan-agents.sh reads them incrementally behind a per-provider
+  // watermark, so a steady-state scan touches only files changed since the
+  // last one. Read-only throughout: nothing under either tool's directory is
+  // ever written.
+  property var agentHistories: Model.emptyAgentHistories()
+  property bool agentsLoaded: false
+  property bool agentsDirty: false
+  property var agentScanQueue: []
+  property string agentScanning: ""
+
+  readonly property string agentsPath: stateDir + "/agents.json"
+
+  FileView {
+    id: agentsFile
+    path: root.agentsPath
+    printErrors: false
+    atomicWrites: true
+    onLoaded: {
+      root.agentHistories = Model.parseAgentHistories(text())
+      root.agentsLoaded = true
+      root.scanAgents()
+    }
+    onLoadFailed: {
+      // First run: no file yet. The first scan back-fills everything both
+      // tools ever recorded, bounded by the scanner's own row caps.
+      root.agentHistories = Model.emptyAgentHistories()
+      root.agentsLoaded = true
+      root.scanAgents()
+    }
+  }
+
+  function saveAgents() {
+    if (!agentsLoaded) return
+    var now = new Date()
+    for (var i = 0; i < Model.AGENT_PROVIDERS.length; i++)
+      Model.prune(root.agentHistories[Model.AGENT_PROVIDERS[i]], now)
+    agentsFile.setText(Model.serializeAgentHistories(root.agentHistories))
+    root.agentsDirty = false
+  }
+
+  function agentEnabled(provider) {
+    return provider === "claude" ? root.importClaude
+         : provider === "codex" ? root.importCodex : false
+  }
+
+  function scanAgents() {
+    if (!agentsLoaded || agentScanProc.running) return
+    var queue = []
+    for (var i = 0; i < Model.AGENT_PROVIDERS.length; i++) {
+      var p = Model.AGENT_PROVIDERS[i]
+      if (agentEnabled(p)) queue.push(p)
+    }
+    root.agentScanQueue = queue
+    scanNextAgent()
+  }
+
+  function scanNextAgent() {
+    if (root.agentScanQueue.length === 0) { root.agentScanning = ""; return }
+    var queue = root.agentScanQueue.slice()
+    var provider = queue.shift()
+    root.agentScanQueue = queue
+    root.agentScanning = provider
+    // The provider name comes from AGENT_PROVIDERS, never from input, so the
+    // mode argument is one of two fixed strings.
+    var since = Math.round(Number(root.agentHistories[provider]
+                                  && root.agentHistories[provider].importedThrough) || 0)
+    if (!isFinite(since) || since < 0) since = 0
+    agentScanProc.command = ["/bin/sh", root.scanScript, provider + "-usage",
+                             Quickshell.env("HOME"), String(since)]
+    agentScanWatchdog.restart()
+    agentScanProc.running = true
+  }
+
+  Process {
+    id: agentScanProc
+    running: false
+    clearEnvironment: true
+    environment: root.emptyEnv
+    stdout: StdioCollector { id: agentScanOut; waitForEnd: true }
+    onExited: function(exitCode, exitStatus) {
+      agentScanWatchdog.stop()
+      var provider = root.agentScanning
+      root.agentScanning = ""
+      if (exitCode === 0 && provider !== "" && root.agentHistories[provider]) {
+        var rows = Model.parseAgentRows(agentScanOut.text,
+                                        root.agentHistories[provider].importedThrough)
+        var result = Model.applyAgentImport(root.agentHistories[provider], rows)
+        if (result.taken > 0) {
+          // A fresh outer identity, or no binding on agentHistories notices.
+          var next = {}
+          for (var k in root.agentHistories) next[k] = root.agentHistories[k]
+          next[provider] = Model.touched(root.agentHistories[provider])
+          root.agentHistories = next
+          root.agentsDirty = true
+        }
+      }
+      root.scanNextAgent()
+    }
+  }
+
+  // A cold first scan chews the full backlog and can take a few seconds; a
+  // wedged one must still not block the queue forever.
+  Timer {
+    id: agentScanWatchdog
+    interval: 30000
+    onTriggered: {
+      root.stopProcess(agentScanProc)
+      root.agentScanQueue = []
+      root.agentScanning = ""
+    }
+  }
+
+  // Cheap when idle: the scanner's find touches only files newer than the
+  // watermark, so a scan with nothing new forks once and reads nothing.
+  Timer {
+    interval: root.opened ? 15000 : 120000
+    running: root.importClaude || root.importCodex
+    repeat: true
+    onTriggered: root.scanAgents()
+  }
+
+  // ---- Agent session lists, read on demand when the pane opens, exactly
+  //      like OpenCode's.
+  property var claudeSessions: []
+  property var codexSessions: []
+  property var agentSessionQueue: []
+  property string agentSessionKind: ""
+
+  // Every source's sessions in one list, newest first. This is what the
+  // panel shows.
+  readonly property var allSessions: Model.mergeSessions([
+    root.sessions, root.claudeSessions, root.codexSessions])
+
+  function loadAgentSessions() {
+    if (agentSessionsProc.running) return
+    var queue = []
+    if (root.importClaude) queue.push("claude")
+    if (root.importCodex) queue.push("codex")
+    root.agentSessionQueue = queue
+    nextAgentSessions()
+  }
+
+  function nextAgentSessions() {
+    if (root.agentSessionQueue.length === 0) { root.agentSessionKind = ""; return }
+    var queue = root.agentSessionQueue.slice()
+    var provider = queue.shift()
+    root.agentSessionQueue = queue
+    root.agentSessionKind = provider
+    agentSessionsProc.command = ["/bin/sh", root.scanScript, provider + "-sessions",
+                                 Quickshell.env("HOME")]
+    agentSessionsWatchdog.restart()
+    agentSessionsProc.running = true
+  }
+
+  Process {
+    id: agentSessionsProc
+    running: false
+    clearEnvironment: true
+    environment: root.emptyEnv
+    stdout: StdioCollector { id: agentSessionsOut; waitForEnd: true }
+    onExited: function(exitCode, exitStatus) {
+      agentSessionsWatchdog.stop()
+      var provider = root.agentSessionKind
+      root.agentSessionKind = ""
+      if (exitCode === 0 && provider === "claude")
+        root.claudeSessions = Model.parseAgentSessions(agentSessionsOut.text, "claude")
+      else if (exitCode === 0 && provider === "codex")
+        root.codexSessions = Model.parseAgentSessions(agentSessionsOut.text, "codex")
+      root.nextAgentSessions()
+    }
+  }
+
+  Timer {
+    id: agentSessionsWatchdog
+    interval: 15000
+    onTriggered: {
+      root.stopProcess(agentSessionsProc)
+      root.agentSessionQueue = []
+      root.agentSessionKind = ""
+    }
+  }
+
+  // Resume any session in a terminal, routed by where it ran. Ids are
+  // pattern-validated per source before they go anywhere near an argv; the
+  // launcher itself is the same allow-listed-environment Process the
+  // OpenCode path uses.
+  readonly property var agentUuidRe: /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
+
+  function openAgentSession(source, id, directory) {
+    var kind = String(source || "")
+    if (kind === "" || kind === "opencode") { openSession(id, directory); return }
+    if (kind !== "claude" && kind !== "codex") return
+    if (!agentUuidRe.test(String(id))) return
+    if (launchProc.running) return
+    var dir = String(directory || "")
+    if (dir.charAt(0) !== "/" || dir.length > 4096) dir = Quickshell.env("HOME")
+    // The mise shim, like OpenCode's: stable across the tools' own upgrades.
+    var shims = Quickshell.env("HOME") + "/.local/share/mise/shims/"
+    launchProc.workingDirectory = dir
+    launchProc.command = kind === "claude"
+      ? ["/usr/bin/omarchy-launch-tui", "--app-id=org.omarchy.agent",
+         shims + "claude", "--resume", String(id)]
+      : ["/usr/bin/omarchy-launch-tui", "--app-id=org.omarchy.agent",
+         shims + "codex", "resume", String(id)]
+    launchProc.running = true
+    root.close()
+  }
+
   // The launcher is the one subprocess that needs a session to talk to, so it
   // cannot run with an empty environment. It gets an explicit ALLOW-LIST built
   // from named variables rather than the inherited environment, and a fixed
@@ -814,6 +1046,21 @@ BarWidget {
     if (typeof panelLoader.item.showSetup === "function") panelLoader.item.showSetup()
     panelLoader.item.open()
   }
+  function openSessions() {
+    if (!panelLoader.item) return
+    if (typeof panelLoader.item.showSessions === "function") panelLoader.item.showSessions()
+    panelLoader.item.open()
+  }
+  function openAgents() {
+    if (!panelLoader.item) return
+    if (typeof panelLoader.item.showAgents === "function") panelLoader.item.showAgents()
+    panelLoader.item.open()
+  }
+  function openGraph(source) {
+    if (!panelLoader.item) return
+    if (typeof panelLoader.item.showGraph === "function") panelLoader.item.showGraph(source)
+    panelLoader.item.open()
+  }
   function closeForPopoutSwitch() { if (panelLoader.item) panelLoader.item.closeForPopoutSwitch() }
 
   function injectPanel() {
@@ -828,7 +1075,8 @@ BarWidget {
     if ("loadedModel" in target) target.loadedModel = root.loadedModel
     if ("rates" in target) target.rates = root.rates
     if ("currencySymbol" in target) target.currencySymbol = root.currencySymbol
-    if ("sessions" in target) target.sessions = root.sessions
+    if ("sessions" in target) target.sessions = root.allSessions
+    if ("agentHistories" in target) target.agentHistories = root.agentHistories
     if ("sourceState" in target) target.sourceState = root.sourceState
     if ("sourceLine" in target) target.sourceLine = root.sourceLine
     if ("overrides" in target) target.overrides = root.overrides
@@ -840,12 +1088,13 @@ BarWidget {
   onHistoryChanged: injectPanel()
   onMemInfoChanged: injectPanel()
   onLoadedModelChanged: injectPanel()
-  onSessionsChanged: injectPanel()
+  onAllSessionsChanged: injectPanel()
+  onAgentHistoriesChanged: injectPanel()
   onSourceStateChanged: injectPanel()
   onOverridesChanged: injectPanel()
-  // Refresh the session list whenever the panel is opened, so it is current
-  // without polling the database in the background.
-  onOpenedChanged: if (root.opened) root.loadSessions()
+  // Refresh the session lists whenever the panel is opened, so they are
+  // current without polling anything in the background.
+  onOpenedChanged: if (root.opened) { root.loadSessions(); root.loadAgentSessions() }
 
   Loader {
     id: panelLoader
@@ -871,6 +1120,13 @@ BarWidget {
     function show(): void { root.open() }
     function hide(): void { root.close() }
     function toggle(): void { root.togglePanel() }
+    // Open straight onto a pane, so "show my AI sessions" can be one
+    // keybinding: omarchy-shell io.github.erikburdett.tokenstats sessions
+    function sessions(): void { root.openSessions() }
+    function agents(): void { root.openAgents() }
+    // graph local|claude|codex — the graph and history views read that
+    // source until it is changed again.
+    function graph(source: string): void { root.openGraph(source) }
   }
 
   // ---------------------------------------------------------------- bar
@@ -919,6 +1175,12 @@ BarWidget {
     lines.push("Saved vs cloud: " + Model.formatMoney(sv.net, root.currencySymbol)
                + "  (at " + root.currencySymbol + root.inputPerMillion + "/"
                + root.currencySymbol + root.outputPerMillion + " per 1M)")
+    // Cloud agents beside the local number, same window, never mixed in.
+    var ct = Model.totals(root.agentHistories.claude, root.barPeriod, new Date())
+    var xt = Model.totals(root.agentHistories.codex, root.barPeriod, new Date())
+    if (ct.c > 0 || xt.c > 0)
+      lines.push("Agents: Claude " + Model.formatTokens(ct.c)
+                 + " · Codex " + Model.formatTokens(xt.c) + " generated")
     if (root.memInfo)
       lines.push("Memory available: " + Model.formatSize(root.memInfo.available))
     lines.push(root.loadedModel !== "" ? "Resident: " + root.loadedModel : "No model resident")
