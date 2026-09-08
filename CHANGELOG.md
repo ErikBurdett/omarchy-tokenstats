@@ -6,6 +6,34 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.5.1] — 2026-09-08
+
+### Fixed
+
+- Replaced full-file agent-log shell pipelines with a bounded, resumable
+  standard-library Python scanner. Per-file cursors let multi-gigabyte logs
+  advance without loading a whole log or event array into memory. Session
+  lists use metadata gathered during these passes.
+- The scanner creates a private process group with no descendants. Added
+  deadlines and TERM-to-KILL cancellation tests, including widget destruction,
+  blocked I/O and reaping. Watchdogs now target only the cancelled invocation.
+- Agent totals and validated progress cursors are saved atomically. Duplicate
+  Claude message IDs and repeated Codex counter events are counted once;
+  delayed replies and equal timestamps no longer disappear behind a watermark.
+  Agent histories rebuild in the new format; local history is preserved.
+- Bounded OpenCode configuration reads, SQLite numeric output and overflow
+  pagination. Added state-directory watchdogs, finite setting validation and
+  protection against model names colliding with JavaScript prototype keys.
+- The panel reports incomplete scans and capacity limits. Requirements now
+  distinguish existing agent records from llama.cpp's optional metrics setup.
+- Replaced the preview with a current screenshot of the live Agents panel.
+
+### Validation
+
+- Added scanner resource/lifecycle fixtures, configuration-reader security
+  tests and QML/SQLite integration regressions to CI, alongside model tests
+  and QML lint.
+
 ## [1.5.0] — 2026-09-07
 
 ### Added

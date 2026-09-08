@@ -20,8 +20,9 @@ new Function("exports", src + `;Object.assign(exports,{
   isLoopbackEndpoint, isLoopbackBaseUrl, parseLocalProviders, providerFilterSql,
   ENDPOINT_CANDIDATES,
   emptyAgentHistories, parseAgentHistories, serializeAgentHistories,
+  emptyAgentCursor, parseAgentCursor, applyAgentScan, AGENT_HISTORY_VERSION,
   parseAgentRows, applyAgentImport, agentPrice, agentSpend,
-  parseAgentSessions, mergeSessions, sourceLabel, filterSessions, AGENT_PROVIDERS });`)(M)
+  parseAgentSessionScan, parseAgentSessions, mergeSessions, sourceLabel, filterSessions, AGENT_PROVIDERS });`)(M)
 
 let fails = 0
 const check = (name, actual, expected) => {
@@ -362,7 +363,11 @@ check("filter is built from validated ids",
       " and json_extract(data,'$.providerID') in ('local','llamacpp')")
 check("no providers means no filter clause", M.providerFilterSql([]), "")
 check("an id that could break out of the quoting is dropped",
-      M.providerFilterSql(["x'); drop table message;--"]), "")
+      M.providerFilterSql(["x'); drop table message;--"]), " and 0")
+check("a malformed filter fails closed", M.providerFilterSql("local"), " and 0")
+check("provider ids are strings, never implicitly coerced", M.providerFilterSql([123]), " and 0")
+check("an invalid filter prefix cannot cause unbounded validation",
+      M.providerFilterSql(Array(64).fill("bad'").concat("local")), " and 0")
 check("a hostile id does not poison its valid siblings",
       M.providerFilterSql(["local", "x' or '1'='1"]),
       " and json_extract(data,'$.providerID') in ('local')")
@@ -550,6 +555,179 @@ check("garbage is empty, not a throw",
 check("unknown provider dropped",
       M.parseAgentHistories('{"version":4,"providers":{"evil":{"version":4,"days":{}}}}').evil, undefined)
 
+console.log("transactional agent scans")
+const clone = value => JSON.parse(JSON.stringify(value))
+const sha = n => n.toString(16).padStart(64, "0")
+const cursorFile = () => ({
+  path: "project/session.jsonl", device: "2049", inode: "12345", offset: 300,
+  anchor: sha(10), model: "claude-sonnet-5", totals: null, discarding: false,
+  sessionId: "f243b8b5-430b-457f-9258-b7d5dd259814", title: "Fix the parser",
+  cwd: "/home/user/project", output: 30, updated: 1788757910000
+})
+const scanRow = (id, when = 1788757910000, output = 30) =>
+  `${when}|${sha(id)}|claude-sonnet-5|2|10|3|${output}`
+const scanEnvelope = (revision, rows = "", status = "complete", reason = "") => ({
+  version: 2, status, reason, rows,
+  cursor: { version: 1, revision, files: [cursorFile()], seen: [sha(1)], skipped: 0 }
+})
+const scan = (history, doc) => M.applyAgentScan(history, JSON.stringify(doc))
+let scanned = M.emptyAgentHistories()
+const firstBatch = scanEnvelope(1, scanRow(1))
+check("a complete bounded scan commits", scan(scanned.claude, firstBatch).accepted, true)
+check("rows and file position commit together",
+      [M.totals(scanned.claude, "all", new Date(1788757910000)).c, scanned.claude.agentCursor.files[0].offset], [30, 300])
+check("agent imports preserve exact cache split",
+      [M.totals(scanned.claude, "all", new Date(1788757910000)).p, M.totals(scanned.claude, "all", new Date(1788757910000)).pc], [5, 10])
+const firstSaved = M.serializeAgentHistories(scanned)
+check("a duplicate completed batch is rejected", scan(scanned.claude, firstBatch).reason, "stale-cursor")
+check("a replay changes neither rows nor cursor", M.serializeAgentHistories(scanned), firstSaved)
+scanned = M.parseAgentHistories(firstSaved)
+check("restart preserves per-file offset and revision",
+      [scanned.claude.agentCursor.files[0].offset, scanned.claude.agentCursor.revision], [300, 1])
+check("restart still rejects a previously committed batch", scan(scanned.claude, firstBatch).accepted, false)
+
+const lateBatch = scanEnvelope(2, [scanRow(2, 1788757900000, 7), scanRow(3, 1788757910000, 8)].join("\n"), "partial", "work-limit")
+lateBatch.cursor.files[0].offset = 600
+lateBatch.cursor.seen = [sha(1), sha(2), sha(3)]
+check("partial work commits delayed and equal-timestamp rows", scan(scanned.claude, lateBatch).taken, 2)
+check("old timestamp cannot move the display watermark backwards", scanned.claude.importedThrough, 1788757910000)
+check("partial work retains all recognized counts", M.totals(scanned.claude, "all", new Date(1788757910000)).c, 45)
+check("cursor is retained through QML repaint copy", M.touched(scanned.claude).agentCursor.revision, 2)
+
+const beforeInvalid = M.serializeAgentHistories(scanned)
+const malformedBatch = scanEnvelope(3, [scanRow(4), scanRow(5).replace("|10|", "|1e2|")].join("\n"))
+check("one malformed row rejects the entire batch", scan(scanned.claude, malformedBatch).accepted, false)
+check("valid prefix and cursor do not leak from rejected batch", M.serializeAgentHistories(scanned), beforeInvalid)
+check("duplicate row identities are rejected atomically",
+      scan(scanned.claude, scanEnvelope(3, [scanRow(4), scanRow(4)].join("\n"))).accepted, false)
+check("out-of-order revision is rejected", scan(scanned.claude, scanEnvelope(4, scanRow(4))).reason, "stale-cursor")
+check("silent numeric clamping is forbidden for agent counts",
+      scan(scanned.claude, scanEnvelope(3, scanRow(4, 1788757910000, 10000001))).accepted, false)
+check("fractional token counts are rejected",
+      scan(scanned.claude, scanEnvelope(3, scanRow(4, 1788757910000, 1.5))).accepted, false)
+check("timestamp outside Date range is rejected",
+      scan(scanned.claude, scanEnvelope(3, scanRow(4, 8640000000000001))).accepted, false)
+check("row producer bound is independently enforced",
+      scan(scanned.claude, scanEnvelope(3, Array.from({ length: 2001 }, (_, i) => scanRow(i + 10)).join("\n"))).accepted, false)
+check("unexpected executable-looking envelope fields are rejected",
+      scan(scanned.claude, { ...scanEnvelope(3), command: "/bin/sh" }).accepted, false)
+check("unknown status text never reaches the panel",
+      scan(scanned.claude, scanEnvelope(3, "", "partial", "<b>untrusted</b>")).accepted, false)
+const failure = { version: 2, status: "error", reason: "file-changed", rows: "", cursor: clone(scanned.claude.agentCursor) }
+check("scanner failure preserves its fixed reason", scan(scanned.claude, failure).reason, "file-changed")
+check("an error cannot smuggle token rows", scan(scanned.claude, { ...failure, rows: scanRow(4) }).reason, "invalid-output")
+check("all failures leave persisted history unchanged", M.serializeAgentHistories(scanned), beforeInvalid)
+
+const progressOnly = scanEnvelope(3, "", "partial", "pending-record")
+check("a batch with no usage still saves progress", scan(scanned.claude, progressOnly).changed, true)
+check("progress-only batches cannot replay", scan(scanned.claude, progressOnly).accepted, false)
+const skipped = scanEnvelope(4, "", "partial", "skipped-records")
+skipped.cursor.skipped = 1
+check("an explicit incomplete scan can record skipped input", scan(scanned.claude, skipped).accepted, true)
+const hiddenSkip = scanEnvelope(5)
+hiddenSkip.cursor.skipped = 1
+check("a scan with skipped records cannot claim complete", scan(scanned.claude, hiddenSkip).accepted, false)
+check("skipped-record evidence cannot disappear", scan(scanned.claude, scanEnvelope(5)).accepted, false)
+
+console.log("agent cursor corruption")
+const validCursor = firstBatch.cursor
+check("valid cursor is copied independently", M.parseAgentCursor(validCursor) === validCursor, false)
+const cursorCases = [
+  ["absolute path", c => { c.files[0].path = "/etc/passwd" }],
+  ["parent traversal", c => { c.files[0].path = "project/../secret.jsonl" }],
+  ["dot traversal", c => { c.files[0].path = "./session.jsonl" }],
+  ["empty path component", c => { c.files[0].path = "project//session.jsonl" }],
+  ["duplicate path", c => { c.files.push(clone(c.files[0])) }],
+  ["hardlink alias", c => { c.files.push({ ...c.files[0], path: "other/session.jsonl" }) }],
+  ["negative offset", c => { c.files[0].offset = -1 }],
+  ["unsafe integer", c => { c.files[0].offset = Number.MAX_SAFE_INTEGER + 1 }],
+  ["fractional offset", c => { c.files[0].offset = 1.5 }],
+  ["absent anchor", c => { c.files[0].anchor = "" }],
+  ["nondecimal inode", c => { c.files[0].inode = "1;exec" }],
+  ["unbounded title", c => { c.files[0].title = "x".repeat(161) }],
+  ["delimiter in title", c => { c.files[0].title = "title|injected" }],
+  ["control in cwd", c => { c.files[0].cwd = "/home/u\nrow" }],
+  ["invalid session id", c => { c.files[0].sessionId = "--command" }],
+  ["model prototype key", c => { c.files[0].model = "__proto__" }],
+  ["invalid cumulative vector", c => { c.files[0].totals = [1, 2, 3] }],
+  ["negative cumulative total", c => { c.files[0].totals = [1, 2, 3, -1] }],
+  ["fake boolean", c => { c.files[0].discarding = "false" }],
+  ["extra cursor field", c => { c.command = "sh" }],
+  ["extra file field", c => { c.files[0].environment = {} }],
+  ["duplicate seen id", c => { c.seen.push(c.seen[0]) }],
+  ["invalid seen id", c => { c.seen[0] = "msg_unhashed" }],
+  ["too many files", c => { c.files = Array.from({ length: 401 }, (_, i) => ({ ...cursorFile(), path: `p/${i}.jsonl` })) }],
+  ["too many seen ids", c => { c.seen = Array.from({ length: 16385 }, (_, i) => sha(i)) }]
+]
+for (const [name, mutate] of cursorCases) {
+  const cursor = clone(validCursor)
+  mutate(cursor)
+  check(`cursor rejects ${name}`, M.parseAgentCursor(cursor), null)
+}
+const byteHeavy = clone(validCursor)
+byteHeavy.files = Array.from({ length: 400 }, (_, i) => ({ ...cursorFile(), inode: String(i + 100), path: "界".repeat(1000) + i,
+  title: "界".repeat(160), cwd: "界".repeat(240) }))
+byteHeavy.seen = Array.from({ length: 16384 }, (_, i) => sha(i))
+check("cursor byte limit matches the scanner JSON encoding", M.parseAgentCursor(byteHeavy), null)
+
+console.log("agent history migration")
+check("agent file format version is independent of local buckets", M.AGENT_HISTORY_VERSION !== M.emptyHistory().version, true)
+const newState = JSON.parse(firstSaved)
+const oldState = clone(newState)
+oldState.version = 4
+check("old agent totals are rebuilt after the accounting repair",
+      M.totals(M.parseAgentHistories(JSON.stringify(oldState)).claude, "all", new Date(1788757910000)).c, 0)
+const retainedLocal = M.parseHistory(JSON.stringify(scanned.claude))
+check("local bucket version is preserved during agent migration",
+      M.totals(retainedLocal, "all", new Date(1788757910000)).c, 45)
+const corruptState = clone(newState)
+corruptState.providers.codex = clone(newState.providers.claude)
+corruptState.providers.claude.agentCursor.files[0].offset = -1
+const repaired = M.parseAgentHistories(JSON.stringify(corruptState))
+check("corrupt cursor resets the matching totals and cursor together",
+      [M.totals(repaired.claude, "all", new Date(1788757910000)).c, repaired.claude.agentCursor.revision], [0, 0])
+check("one corrupt provider does not discard the other", M.totals(repaired.codex, "all", new Date(1788757910000)).c, 30)
+delete corruptState.providers.codex.agentCursor
+check("missing cursor cannot keep already counted buckets",
+      M.totals(M.parseAgentHistories(JSON.stringify(corruptState)).codex, "all", new Date(1788757910000)).c, 0)
+const roomyState = M.emptyAgentHistories()
+const fullCursor = clone(validCursor)
+fullCursor.files = Array.from({ length: 400 }, (_, i) => ({ ...cursorFile(), inode: String(i + 100), path: "x".repeat(1000) + i,
+  title: "x".repeat(160), cwd: "x".repeat(240) }))
+fullCursor.seen = Array.from({ length: 16384 }, (_, i) => sha(i))
+roomyState.claude.agentCursor = fullCursor
+const fullBucket = { p: 32, pc: 64, c: 96, s: 0, n: 32, m: 0,
+  byModel: Object.fromEntries(Array.from({ length: 32 }, (_, i) => [`model-${i}`, { p: 1, pc: 2, c: 3, s: 0, m: 0 }])) }
+for (let i = 0; i < 400; i++) {
+  const date = new Date(Date.UTC(2026, 0, 1 + i))
+  roomyState.claude.days[date.toISOString().slice(0, 10)] = clone(fullBucket)
+}
+roomyState.codex = clone(roomyState.claude)
+const roomySaved = M.serializeAgentHistories(roomyState)
+check("two valid cursors and retained history can exceed the local file cap", roomySaved.length > 4194304, true)
+const roomyRestored = M.parseAgentHistories(roomySaved)
+check("both providers survive a valid combined state larger than 4 MiB",
+      [roomyRestored.claude.agentCursor.revision, roomyRestored.codex.agentCursor.revision,
+       Object.keys(roomyRestored.claude.days).length, Object.keys(roomyRestored.codex.days).length], [1, 1, 400, 400])
+check("oversized combined agent state is still rejected",
+      M.parseAgentHistories(" ".repeat(16777217)).claude.agentCursor.revision, 0)
+
+console.log("model object-key defense")
+for (const key of ["__proto__", "constructor", "toString", "valueOf", "hasOwnProperty", "prototype"])
+  check(`reserved model name ${key} rejected`, M.modelKey(key), "")
+const prototypeBefore = Object.getOwnPropertyDescriptors(Object.prototype)
+const hostileHistory = M.emptyHistory()
+M.record(hostileHistory, { promptTokens: 3, promptCached: 4, predictedTokens: 5, predictedSeconds: 0 },
+         new Date(1788757910000), 1, false, "__proto__")
+check("recording a hostile model leaves Object.prototype unchanged",
+      Object.getOwnPropertyDescriptors(Object.prototype), prototypeBefore)
+check("inherited object properties never become model rows",
+      M.modelBreakdown(M.totals(hostileHistory, "all", new Date(1788757910000))), [])
+check("unsafe loaded-model map keys are refused before QML stores them",
+      M.parseLoadedModels(JSON.stringify({ data: ["__proto__", "constructor", "toString", "safe"].map(id => ({ id, status: { value: "loaded" } })) })), ["safe"])
+check("hostile scanner model rejects the batch before record",
+      scan(M.emptyAgentHistories().claude, scanEnvelope(1, scanRow(1).replace("claude-sonnet-5", "__proto__"))).accepted, false)
+
 console.log("agent pricing")
 check("fable priced", M.agentPrice("claude-fable-5"), { input: 10, cachedInput: 1, output: 50 })
 check("opus priced", M.agentPrice("claude-opus-5").output, 25)
@@ -571,6 +749,42 @@ check("spend prices input, cached and output", Number(spent.spend.toFixed(2)), 5
 check("unpriced tokens reported, not silently dropped", spent.unpriced, 500000)
 
 console.log("agent sessions")
+const sessionScan = scanEnvelope(1, "F243B8B5-430B-457F-9258-B7D5DD259814|Fix parser|5000|claude-sonnet-5|/home/user/project|1788757910000")
+const sessionResult = M.parseAgentSessionScan(JSON.stringify(sessionScan), "claude")
+check("session envelope validates and exposes its rows", sessionResult.accepted, true)
+check("session UUID normalized for safe launcher validation", sessionResult.sessions[0].id, "f243b8b5-430b-457f-9258-b7d5dd259814")
+check("session tokens are parsed exactly", sessionResult.sessions[0].tokens, 5000)
+check("session source is caller-selected, never supplied by log", sessionResult.sessions[0].source, "claude")
+check("session parsing cannot mutate the caller cursor", sessionScan.cursor.revision, 1)
+check("unexpected session provider is rejected", M.parseAgentSessionScan(JSON.stringify(sessionScan), "sh").accepted, false)
+check("raw legacy session output is not a successful v2 scan", M.parseAgentSessionScan(sessionScan.rows, "claude").accepted, false)
+const brokenSession = clone(sessionScan)
+brokenSession.rows += "\nnot-a-session"
+check("a valid session prefix cannot mask malformed output", M.parseAgentSessionScan(JSON.stringify(brokenSession), "claude").accepted, false)
+brokenSession.rows = sessionScan.rows + "\n" + sessionScan.rows
+check("duplicate session identities are rejected", M.parseAgentSessionScan(JSON.stringify(brokenSession), "claude").accepted, false)
+brokenSession.rows = sessionScan.rows.replace("|5000|", "|5000oops|")
+check("session numbers cannot use parseInt prefix coercion", M.parseAgentSessionScan(JSON.stringify(brokenSession), "claude").accepted, false)
+brokenSession.rows = sessionScan.rows.replace("claude-sonnet-5", "constructor")
+check("session model cannot reference an inherited object", M.parseAgentSessionScan(JSON.stringify(brokenSession), "claude").accepted, false)
+const emptySessions = scanEnvelope(1)
+check("empty session view is a valid result", M.parseAgentSessionScan(JSON.stringify(emptySessions), "codex").sessions, [])
+const partialSessions = clone(sessionScan)
+partialSessions.cursor.skipped = 1
+partialSessions.status = "partial"
+partialSessions.reason = "skipped-records"
+check("incomplete session cache is explicitly marked", M.parseAgentSessionScan(JSON.stringify(partialSessions), "claude").status, "partial")
+partialSessions.status = "complete"
+partialSessions.reason = ""
+check("session cache cannot hide skipped records", M.parseAgentSessionScan(JSON.stringify(partialSessions), "claude").accepted, false)
+const unicodeCursor = clone(validCursor)
+unicodeCursor.files[0].title = "😀".repeat(80)
+check("cursor title limit matches the scanner Unicode convention", M.parseAgentCursor(unicodeCursor).files[0].title, unicodeCursor.files[0].title)
+unicodeCursor.files[0].title += "😀"
+check("cursor title UTF-16 bound is shared with the scanner", M.parseAgentCursor(unicodeCursor), null)
+const tooManySessions = clone(sessionScan)
+tooManySessions.rows = Array.from({ length: 101 }, (_, i) => sessionScan.rows.replace("F243B8B5", i.toString(16).padStart(8, "0"))).join("\n")
+check("session producer row bound is independently enforced", M.parseAgentSessionScan(JSON.stringify(tooManySessions), "claude").accepted, false)
 const ASESS = [
   "f243b8b5-430b-457f-9258-b7d5dd259814|Fix the parser|5000|claude-fable-5|/home/x|1788757901000",
   "not-a-uuid|title|100|m|/d|1",

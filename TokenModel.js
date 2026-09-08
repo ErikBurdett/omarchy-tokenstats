@@ -114,7 +114,7 @@ function parseLoadedModels(jsonText) {
       var m = list[i]
       var status = m && m.status && m.status.value
       if (status !== "loaded") continue
-      if (typeof m.id !== "string" || !MODEL_ID_RE.test(m.id)) continue
+      if (typeof m.id !== "string" || !MODEL_ID_RE.test(m.id) || modelKey(m.id) !== m.id) continue
       if (out.indexOf(m.id) === -1) out.push(m.id)
     }
   } catch (e) {
@@ -199,16 +199,19 @@ function parseLocalProviders(configText) {
   return out.sort()
 }
 
-// A SQL IN list, or "" when there is nothing to filter on. Every id is
+// A SQL IN list, or "" when the caller deliberately requested no filter. An
+// invalid supplied filter fails closed; dropping it would select hosted rows.
+// Every id is
 // re-validated here rather than trusting the caller, because this string is
 // concatenated into a statement.
 function providerFilterSql(ids) {
-  if (!Array.isArray(ids) || ids.length === 0) return ""
+  if (!Array.isArray(ids)) return " and 0"
+  if (ids.length === 0) return ""
   var safe = []
-  for (var i = 0; i < ids.length && safe.length < 64; i++) {
-    if (PROVIDER_ID_RE.test(ids[i])) safe.push("'" + ids[i] + "'")
+  for (var i = 0; i < ids.length && i < 64; i++) {
+    if (typeof ids[i] === "string" && PROVIDER_ID_RE.test(ids[i])) safe.push("'" + ids[i] + "'")
   }
-  if (safe.length === 0) return ""
+  if (safe.length === 0) return " and 0"
   return " and json_extract(data,'$.providerID') in (" + safe.join(",") + ")"
 }
 
@@ -480,7 +483,10 @@ function modelKey(name) {
   var raw = String(name === undefined || name === null ? "" : name).trim()
   if (raw.length === 0) return ""
   var cleaned = raw.replace(/[^A-Za-z0-9._-]/g, "")
-  return cleaned.substring(0, MAX_MODEL_NAME)
+  var key = cleaned.substring(0, MAX_MODEL_NAME)
+  // These names otherwise resolve to inherited values in the bucket maps.
+  if (key === "prototype" || Object.prototype.hasOwnProperty.call(Object.prototype, key)) return ""
+  return key
 }
 
 function addModel(bucket, model, delta, metered) {
@@ -1302,34 +1308,159 @@ function shapeTitle(raw) {
 // assistant message, Codex stores the API's per-turn usage in its
 // token_count events.
 var AGENT_PROVIDERS = ["claude", "codex"]
+// Agent ingestion now uses persisted file positions, replacing a timestamp
+// watermark that dropped delayed rows and reused cumulative Codex events. Only
+// agents.json is rebuilt; HISTORY_VERSION and local metered history stay put.
+var AGENT_HISTORY_VERSION = 5
+// The file holds two bounded 2 MiB cursors plus both retained bucket sets.
+// Applying the local history's 4 MiB cap here could discard valid saved data.
+var MAX_AGENT_STATE_BYTES = 16777216
+var MAX_AGENT_CURSOR_BYTES = 2097152
+var MAX_AGENT_FILES = 400
+var MAX_AGENT_SEEN = 16384
+var MAX_AGENT_ROWS = 2000
+var AGENT_SCAN_REASONS = ["", "work-limit", "file-limit", "entry-limit", "depth-limit",
+  "row-limit", "skipped-records", "pending-record", "cursor-limit", "unsafe-file",
+  "file-changed", "source-missing", "invalid-cursor", "invalid-arguments", "read-error",
+  "deadline", "memory-limit", "cancelled", "internal-error"]
+
+function emptyAgentCursor() {
+  return { version: 1, revision: 0, files: [], seen: [], skipped: 0 }
+}
+
+function agentInteger(v, cap) {
+  return isNum(v) && Math.floor(v) === v && v >= 0 && v <= cap
+}
+
+function agentObject(v, keys) {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return false
+  var actual = Object.keys(v)
+  if (actual.length !== keys.length) return false
+  for (var i = 0; i < keys.length; i++)
+    if (!Object.prototype.hasOwnProperty.call(v, keys[i])) return false
+  return true
+}
+
+function agentText(v, cap) {
+  // The Python scanner uses these same UTF-16 limits when shortening text.
+  return typeof v === "string" && v.length <= cap && !/[\u0000-\u001f\u007f-\u009f|]/.test(v)
+}
+
+function agentUtf8Fits(text, cap) {
+  if (text.length > cap) return false
+  var bytes = 0
+  for (var i = 0; i < text.length; i++) {
+    var code = text.charCodeAt(i)
+    if (code < 128) bytes++
+    else if (code < 2048) bytes += 2
+    else if (code >= 0xd800 && code <= 0xdbff && i + 1 < text.length &&
+             text.charCodeAt(i + 1) >= 0xdc00 && text.charCodeAt(i + 1) <= 0xdfff) {
+      bytes += 4
+      i++
+    } else bytes += 3
+    if (bytes > cap) return false
+  }
+  return true
+}
+
+function agentCursorFits(cursor) {
+  // Match the helper's ensure_ascii JSON representation, including its byte
+  // bound, so persisted Unicode paths cannot validate here then fail there.
+  var encoded = JSON.stringify(cursor), bytes = 0
+  for (var i = 0; i < encoded.length; i++) {
+    bytes += encoded.charCodeAt(i) < 128 ? 1 : 6
+    if (bytes > MAX_AGENT_CURSOR_BYTES) return false
+  }
+  return true
+}
+
+// A cursor is data, never executable state. Validate every field, not merely
+// its byte size, before it can be persisted or sent to the descriptor-bound
+// scanner. A corrupt cursor must reset its matching totals as well: retaining
+// the buckets while restarting at byte zero would count them again.
+function parseAgentCursor(src) {
+  if (!agentObject(src, ["version", "revision", "files", "seen", "skipped"]) || src.version !== 1 ||
+      !agentInteger(src.revision, Number.MAX_SAFE_INTEGER - 1) ||
+      !agentInteger(src.skipped, Number.MAX_SAFE_INTEGER) ||
+      !Array.isArray(src.files) || src.files.length > MAX_AGENT_FILES ||
+      !Array.isArray(src.seen) || src.seen.length > MAX_AGENT_SEEN) return null
+  var paths = Object.create(null), identities = Object.create(null), hashes = Object.create(null)
+  var out = { version: 1, revision: src.revision, files: [], seen: [], skipped: src.skipped }
+  var fileKeys = ["path", "device", "inode", "offset", "anchor", "model", "totals",
+    "discarding", "sessionId", "title", "cwd", "output", "updated"]
+  for (var i = 0; i < src.files.length; i++) {
+    var f = src.files[i]
+    if (!agentObject(f, fileKeys) || !agentText(f.path, 1024) || !f.path || f.path.charAt(0) === "/" ||
+        /(^|\/)(\.|\.\.)(\/|$)/.test(f.path) || f.path.indexOf("//") !== -1 ||
+        f.path.charAt(f.path.length - 1) === "/" || paths[f.path] ||
+        typeof f.device !== "string" || !/^[0-9]{1,32}$/.test(f.device) ||
+        typeof f.inode !== "string" || !/^[0-9]{1,32}$/.test(f.inode) || identities[f.device + ":" + f.inode] ||
+        !agentInteger(f.offset, Number.MAX_SAFE_INTEGER) ||
+        typeof f.anchor !== "string" || (f.offset === 0 ? f.anchor !== "" : !/^[a-f0-9]{64}$/.test(f.anchor)) ||
+        typeof f.model !== "string" || !MODEL_ID_RE.test(f.model) || modelKey(f.model) !== f.model ||
+        typeof f.discarding !== "boolean" || typeof f.sessionId !== "string" ||
+        (f.sessionId !== "" && !/^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$/.test(f.sessionId)) ||
+        !agentText(f.title, 160) || !agentText(f.cwd, 240) ||
+        !agentInteger(f.output, Number.MAX_SAFE_INTEGER) || !agentInteger(f.updated, 8640000000000000)) return null
+    if (f.totals !== null) {
+      if (!Array.isArray(f.totals) || f.totals.length !== 4) return null
+      for (var t = 0; t < f.totals.length; t++)
+        if (!agentInteger(f.totals[t], Number.MAX_SAFE_INTEGER)) return null
+    }
+    paths[f.path] = true
+    identities[f.device + ":" + f.inode] = true
+    out.files.push({ path: f.path, device: f.device, inode: f.inode, offset: f.offset,
+      anchor: f.anchor, model: f.model, totals: f.totals === null ? null : f.totals.slice(),
+      discarding: f.discarding, sessionId: f.sessionId, title: f.title, cwd: f.cwd,
+      output: f.output, updated: f.updated })
+  }
+  for (var s = 0; s < src.seen.length; s++) {
+    var hash = src.seen[s]
+    if (typeof hash !== "string" || !/^[a-f0-9]{64}$/.test(hash) || hashes[hash]) return null
+    hashes[hash] = true
+    out.seen.push(hash)
+  }
+  if (!agentCursorFits(out)) return null
+  return out
+}
+
+function emptyAgentHistory() {
+  var out = emptyHistory()
+  out.agentCursor = emptyAgentCursor()
+  return out
+}
 
 function emptyAgentHistories() {
   var out = {}
   for (var i = 0; i < AGENT_PROVIDERS.length; i++)
-    out[AGENT_PROVIDERS[i]] = emptyHistory()
+    out[AGENT_PROVIDERS[i]] = emptyAgentHistory()
   return out
 }
 
 // agents.json is { version: N, providers: { claude: <history>, codex: … } }.
-// Unknown providers are dropped; each provider entry is re-validated by the
-// same parser history.json goes through. HISTORY_VERSION doubles as the file
-// version: the buckets inside are exactly that format.
+// Unknown providers are dropped. The outer version is independent from the
+// shared bucket format so an ingestion repair never destroys local timing.
 function parseAgentHistories(text) {
   var out = emptyAgentHistories()
   var raw = String(text === undefined || text === null ? "" : text)
-  if (raw.length === 0 || raw.length > MAX_STATE_BYTES) return out
+  if (raw.length === 0 || !agentUtf8Fits(raw, MAX_AGENT_STATE_BYTES)) return out
   var doc
   try {
     doc = JSON.parse(raw)
   } catch (e) {
     return out
   }
-  if (!doc || typeof doc !== "object" || doc.version !== HISTORY_VERSION) return out
+  if (!doc || typeof doc !== "object" || doc.version !== AGENT_HISTORY_VERSION) return out
   var src = doc.providers
   if (!src || typeof src !== "object") return out
   for (var i = 0; i < AGENT_PROVIDERS.length; i++) {
     var p = AGENT_PROVIDERS[i]
-    if (src[p]) out[p] = parseHistoryDoc(src[p])
+    var history = src[p]
+    if (!history || history.version !== HISTORY_VERSION) continue
+    var cursor = parseAgentCursor(history.agentCursor)
+    if (!cursor) continue
+    out[p] = parseHistoryDoc(history)
+    out[p].agentCursor = cursor
   }
   return out
 }
@@ -1338,9 +1469,78 @@ function serializeAgentHistories(histories) {
   var providers = {}
   for (var i = 0; i < AGENT_PROVIDERS.length; i++) {
     var p = AGENT_PROVIDERS[i]
-    providers[p] = (histories && histories[p]) ? histories[p] : emptyHistory()
+    providers[p] = (histories && histories[p]) ? histories[p] : emptyAgentHistory()
   }
-  return JSON.stringify({ version: HISTORY_VERSION, providers: providers })
+  return JSON.stringify({ version: AGENT_HISTORY_VERSION, providers: providers })
+}
+
+// Successful helper output is one transaction: the exact recognized rows and
+// their new file positions must either both survive or both be retried. The
+// revision matches the cursor sent to this scan, refusing a replay even when
+// the batch contains no tokens. Timestamps never decide whether v2 rows are
+// new: a delayed file and equal timestamps are legitimate new usage.
+function applyAgentScan(history, text) {
+  var rejected = { accepted: false, changed: false, taken: 0, newest: 0, status: "error", reason: "invalid-output" }
+  if (!history || history.version !== HISTORY_VERSION || typeof text !== "string" ||
+      text.length === 0 || !agentUtf8Fits(text, MAX_STATE_BYTES)) return rejected
+  var doc
+  try { doc = JSON.parse(text) } catch (e) { return rejected }
+  if (!agentObject(doc, ["version", "status", "reason", "rows", "cursor"]) || doc.version !== 2 ||
+      ["complete", "partial", "error"].indexOf(doc.status) === -1 ||
+      AGENT_SCAN_REASONS.indexOf(doc.reason) === -1 || typeof doc.rows !== "string") return rejected
+  var cursor = parseAgentCursor(doc.cursor)
+  var previous = parseAgentCursor(history.agentCursor)
+  if (!cursor || !previous) return rejected
+  if (doc.status === "error") {
+    if (doc.rows !== "" || !doc.reason || JSON.stringify(cursor) !== JSON.stringify(previous)) return rejected
+    rejected.reason = doc.reason
+    return rejected
+  }
+  if ((doc.status === "complete" && doc.reason !== "" && doc.reason !== "source-missing") ||
+      (doc.status === "partial" && doc.reason === "") ||
+      (cursor.skipped > 0 && (doc.status !== "partial" || doc.reason !== "skipped-records")) ||
+      cursor.skipped < previous.skipped) return rejected
+  if (cursor.revision !== previous.revision + 1) {
+    rejected.reason = "stale-cursor"
+    return rejected
+  }
+  var lines = doc.rows === "" ? [] : doc.rows.split("\n")
+  if (lines.length && lines[lines.length - 1] === "") lines.pop()
+  if (lines.length > MAX_AGENT_ROWS) return rejected
+  var rows = [], ids = Object.create(null), newest = 0
+  for (var i = 0; i < lines.length; i++) {
+    var f = lines[i].split("|")
+    if (f.length !== 7 || !/^[0-9]{1,16}$/.test(f[0]) || !/^[a-f0-9]{64}$/.test(f[1]) || ids[f[1]] ||
+        !MODEL_ID_RE.test(f[2]) || modelKey(f[2]) !== f[2]) return rejected
+    var when = Number(f[0]), counts = []
+    if (!agentInteger(when, 8640000000000000) || when === 0) return rejected
+    for (var c = 3; c < 7; c++) {
+      if (!/^[0-9]{1,8}$/.test(f[c]) || !agentInteger(Number(f[c]), MAX_TOKENS_PER_SAMPLE)) return rejected
+      counts.push(Number(f[c]))
+    }
+    if (counts[0] + counts[2] > MAX_TOKENS_PER_SAMPLE) return rejected
+    ids[f[1]] = true
+    rows.push({ when: when, model: f[2], promptTokens: counts[0] + counts[2],
+      promptCached: counts[1], predictedTokens: counts[3], predictedSeconds: 0 })
+    if (when > newest) newest = when
+  }
+  // Stage on independent bucket maps. No history or cursor is modified until
+  // every row, count and cursor field has passed the checks above.
+  var staged = parseHistoryDoc(history), taken = 0
+  for (var r = 0; r < rows.length; r++) {
+    var row = rows[r]
+    if (row.promptTokens === 0 && row.promptCached === 0 && row.predictedTokens === 0) continue
+    record(staged, row, new Date(row.when), 1, false, row.model)
+    taken++
+  }
+  staged.importedThrough = Math.max(staged.importedThrough, newest)
+  history.minutes = staged.minutes
+  history.hours = staged.hours
+  history.days = staged.days
+  history.importedThrough = staged.importedThrough
+  history.covered = staged.covered
+  history.agentCursor = cursor
+  return { accepted: true, changed: true, taken: taken, newest: newest, status: doc.status, reason: doc.reason }
 }
 
 // One row per API reply from the scan script:
@@ -1385,6 +1585,8 @@ function parseAgentRows(text, notBefore) {
   return out
 }
 
+// Legacy row-import utility; the running widget uses applyAgentScan and its
+// persisted file cursor instead. Kept for callers with already ordered rows.
 // Fold agent rows in behind a single per-provider watermark. Unlike the local
 // import there is no live source racing this one, so the watermark is simply
 // the newest row ever recorded: rows at or before it were counted, everything
@@ -1471,6 +1673,46 @@ function agentSpend(bucket) {
 // Ids are UUIDs (both tools) and are handed to a launcher, so they are
 // pattern-validated, not repaired.
 var UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
+
+// Sessions are a bounded view of the same validated cursor, with no log
+// rereading or cursor advancement. A malformed envelope must not replace a
+// previously visible session list with a plausible partial parse.
+function parseAgentSessionScan(text, source) {
+  var rejected = { accepted: false, sessions: [], status: "error", reason: "invalid-output" }
+  if (AGENT_PROVIDERS.indexOf(source) === -1 || typeof text !== "string" ||
+      text.length === 0 || !agentUtf8Fits(text, MAX_STATE_BYTES)) return rejected
+  var doc
+  try { doc = JSON.parse(text) } catch (e) { return rejected }
+  if (!agentObject(doc, ["version", "status", "reason", "rows", "cursor"]) || doc.version !== 2 ||
+      ["complete", "partial", "error"].indexOf(doc.status) === -1 ||
+      AGENT_SCAN_REASONS.indexOf(doc.reason) === -1 || typeof doc.rows !== "string") return rejected
+  var cursor = parseAgentCursor(doc.cursor)
+  if (!cursor) return rejected
+  if (doc.status === "error") {
+    if (doc.rows === "" && doc.reason) rejected.reason = doc.reason
+    return rejected
+  }
+  if ((doc.status === "complete" && doc.reason !== "") ||
+      (doc.status === "partial" && doc.reason !== "skipped-records") ||
+      (cursor.skipped > 0) !== (doc.status === "partial")) return rejected
+  var lines = doc.rows === "" ? [] : doc.rows.split("\n")
+  if (lines.length && lines[lines.length - 1] === "") lines.pop()
+  if (lines.length > MAX_SESSIONS) return rejected
+  var sessions = [], ids = Object.create(null)
+  for (var i = 0; i < lines.length; i++) {
+    var f = lines[i].split("|")
+    var id = f.length === 6 ? f[0].toLowerCase() : ""
+    if (f.length !== 6 || !UUID_RE.test(id) || ids[id] ||
+        !agentText(f[1], 160) || !/^[0-9]{1,16}$/.test(f[2]) ||
+        !agentInteger(Number(f[2]), Number.MAX_SAFE_INTEGER) || Number(f[2]) === 0 ||
+        !MODEL_ID_RE.test(f[3]) || modelKey(f[3]) !== f[3] || !agentText(f[4], 240) ||
+        !/^[0-9]{1,16}$/.test(f[5]) || !agentInteger(Number(f[5]), 8640000000000000)) return rejected
+    ids[id] = true
+    sessions.push({ id: id, title: cleanTitle(f[1], ""), tokens: Number(f[2]), model: f[3],
+      directory: f[4], at: Number(f[5]), source: source })
+  }
+  return { accepted: true, sessions: sessions, status: doc.status, reason: doc.reason }
+}
 
 function parseAgentSessions(text, source) {
   var raw = String(text === undefined || text === null ? "" : text)

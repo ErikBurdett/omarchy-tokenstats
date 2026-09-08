@@ -32,6 +32,7 @@ Panel {
   property string currencySymbol: "$"
   property string sourceState: "none"
   property string sourceLine: ""
+  property string agentStatusLine: ""
 
   // Panel-set overrides and the shell.json values beneath them, both injected
   // by the widget. The pane shows the effective value and says where it came
@@ -1242,7 +1243,7 @@ Panel {
           width: parent.width
           wrapMode: Text.WordWrap
           textFormat: Text.PlainText
-          text: root.sourceLine
+          text: root.sourceLine + (root.agentStatusLine !== "" ? "\n" + root.agentStatusLine : "")
           color: root.sourceState === "none" ? (root.bar ? root.bar.urgent : Color.urgent) : root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption

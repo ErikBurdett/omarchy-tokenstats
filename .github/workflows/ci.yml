@@ -30,6 +30,12 @@ jobs:
       - name: Model unit tests
         run: node test/tokenmodel-test.mjs
 
+      - name: Bounded readers and process lifecycle
+        run: |
+          python3 -B test/scan-agents-test.py
+          python3 -B test/read-config-test.py
+          node test/qml-runtime-test.mjs
+
       - name: Packaging checks
         run: bash scripts/qa.sh
 

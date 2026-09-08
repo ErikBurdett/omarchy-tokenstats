@@ -55,17 +55,16 @@ bytes-per-token constant anywhere in this plugin.
 
 ## Requirements
 
-Omarchy 4 (Quattro) with `omarchy-shell`, and a local model you actually run.
-
-**No configuration, no flags, nothing to enable.** The plugin reads exact token
-counts from whichever source is present, and at least one of them needs nothing
-from you:
+Omarchy 4 (Quattro) with `omarchy-shell`, Python 3, and at least one supported
+source of recorded usage. A local model is optional when using Claude Code or
+Codex. The plugin does not install tools or enable server metrics.
 
 | What you already run | Counts with zero configuration? |
 |---|---|
-| **llama-swap** | **Yes.** Found by probing loopback; every resident model is sampled. |
-| **llama-server** run directly, no proxy | **Yes.** Its counters live at `/metrics` rather than `/upstream/<id>/metrics`, and the shape is detected rather than assumed. |
+| **llama-swap** with llama.cpp `--metrics` already enabled | **Yes.** Found by probing loopback; every resident model is sampled. |
+| **llama-server** run directly with `--metrics` | **Yes.** Its counters live at `/metrics` rather than `/upstream/<id>/metrics`; the shape is detected automatically. |
 | Local models through **OpenCode** | **Yes.** OpenCode stores the provider's own `usage` block for every reply, so the counts are exact and already on disk. Which of your providers are local is read from your `opencode.json`, not guessed. |
+| **Claude Code** or **Codex**, including a machine with no local models | **Yes.** Existing default-location session records are imported into the Agents, Graph and History views. The bar still reports local tokens/hour. Large backlogs fill in over several bounded passes. |
 | llama.cpp without `--metrics`, and no OpenCode | No — there is no exact record to read, and this plugin will not estimate one. |
 
 **Nothing is hardcoded to one machine.** The endpoint defaults to `auto`: the
@@ -95,28 +94,22 @@ which providers it is importing.
 
 ### Verifying that for yourself
 
-The no-configuration path is easy to reproduce, and worth doing if you are
-reviewing this rather than using it. Point the plugin at anything that serves
-llama-swap's model list but refuses metrics — a five-line mock is enough — then
-start the shell with no stored state at all:
+The automated regression fixtures exercise fresh agent histories using only
+synthetic Claude Code and Codex logs; no local model or server is needed:
 
 ```bash
-# stop the shell first: a running one writes its in-memory history back on exit
-while timeout 5 quickshell kill -p "$OMARCHY_PATH/shell" --any-display; do :; done
-rm -rf ~/.local/state/omarchy/tokenstats
-hyprctl dispatch 'hl.dsp.exec_cmd("omarchy-launch-shell")'
+python3 -B test/scan-agents-test.py
+node test/tokenmodel-test.mjs
+node test/qml-runtime-test.mjs
 ```
 
-With `/upstream/<model>/metrics` answering `501` and no prior state, the widget
-still fills in from OpenCode within a refresh or two. Measured on the machine
-this was written on: **199,762 generated tokens across four days**, with the
-recorded generation seconds at exactly `0` — which is the proof that none of it
-came from the live counters. The panel footer reads *"Counting from OpenCode's
-records."*
+These checks cover resumable imports and restart/replay handling. They keep
+your existing history intact. With metrics unavailable, OpenCode also remains
+an independent source of exact local counts.
 
 ### Optional: live counting from llama.cpp
 
-This step is **optional** and the plugin is fully functional without it. It adds
+This step is **optional when usage is available from another supported source**. It adds
 two things: **live throughput** (tokens per second, which OpenCode's records
 cannot provide) and coverage of **clients other than OpenCode**.
 
@@ -141,10 +134,9 @@ because the other source was assumed to have it.
 
 ### External dependencies
 
-All of these are already on any Omarchy machine; nothing is installed by the
-plugin, and nothing runs as root. `curl` and `coreutils` are part of the base
-system, and `sqlite` is a hard dependency of `qt6-base`, which Omarchy requires
-through Quickshell — so `/usr/bin/sqlite3` is always present.
+The plugin installs nothing and runs with your user's privileges. The table
+lists runtime dependencies; the read-only agent scanner uses Python's standard
+library and needs no pip packages. Missing readers leave existing totals intact.
 
 If one were somehow missing, the plugin degrades rather than breaks: a
 non-zero exit is treated as "no data from this source", never as an empty
@@ -154,14 +146,14 @@ result.
 |---|---|
 | `/usr/bin/curl` | Reading the llama-swap and llama.cpp endpoints over loopback |
 | `/usr/bin/sqlite3` | Reading OpenCode's database, **read-only**, for backfill and the sessions list |
-| `/usr/bin/jq` | Parsing Claude Code's and Codex's own session records (`scripts/scan-agents.sh`), read-only |
+| `/usr/bin/python3` | Bounded, resumable agent-log scanning and bounded OpenCode config reads; standard library only, isolated mode (`-I -S`) |
 | `/usr/bin/install` | Creating this plugin's own state directory, mode 0700 (`install -d` rather than `mkdir -p -m`, because it also corrects the mode of a directory that already exists) |
 | `/usr/bin/omarchy-launch-tui` | Opening a terminal when you click a session (Omarchy's own launcher) |
 
 The plugin never writes to OpenCode's database — it is opened with
 `sqlite3 -readonly` against a `mode=ro` URI — and never writes anything under
 `~/.claude` or `~/.codex`; the scan script only reads them and emits bounded
-pipe-separated rows.
+JSON batches containing bounded rows and progress cursors.
 
 ## Install
 
@@ -231,7 +223,7 @@ In **Setup > Plugins > Token Stats**, or on the widget's entry in
 | System draw while generating (W) | `120` | Used to cost your own electricity |
 | Electricity price per kWh | `0.12` | |
 | Currency symbol | `$` | |
-| llama-swap endpoint | `http://127.0.0.1:8080` | Loopback only; anything else is ignored |
+| llama.cpp endpoint | `auto` | Probes fixed loopback ports; non-loopback overrides are ignored |
 
 The default cloud prices are a *stated assumption*, not a measurement — the
 plugin cannot know which service you would otherwise have used. They are printed
@@ -270,7 +262,9 @@ once a minute. Retention is 72 hourly and 400 daily buckets — a few tens of Ki
 OpenCode records the provider's own `usage` block for every reply, so its
 database is an exact source for tokens generated before this widget existed,
 while the shell was not running, or in any window live sampling could not vouch
-for. The plugin imports from it read-only, filtered to `providerID = local`.
+for. The plugin imports from it read-only, filtered to provider IDs whose
+configured base URL is loopback (falling back to the conventional `local` ID
+when configuration cannot be read). Invalid provider lists fail closed.
 
 A row is admitted against **its own model's** coverage mark, not one global
 watermark. That distinction matters: llama-swap restarts one `llama-server` at a
@@ -317,23 +311,38 @@ Generated tokens have no such subtlety and are exact from either source.
 
 Both tools write the API's **own exact usage** to disk — Claude Code per
 assistant message in `~/.claude/projects/*/*.jsonl`, Codex per turn in
-`~/.codex/sessions/**/rollout-*.jsonl` — and `scripts/scan-agents.sh` reads
-those records with `jq`, read-only, behind a per-provider watermark. A
-steady-state scan touches only files modified since the last one, so the
-recurring cost is one short-lived process that usually reads nothing; the
-first scan back-fills everything both tools ever recorded (about half a second
-for 77 MB of history on the machine this was written on).
+`~/.codex/sessions/**/rollout-*.jsonl`. `scripts/scan-agents.py` reads bounded
+batches using Python's standard library. Each file has a persisted offset and
+parsing context, so even multi-gigabyte logs can make progress without loading
+the whole file or restarting from its beginning. The session list uses metadata
+collected during those passes rather than rescanning the logs.
 
 Duplicate streaming lines in Claude Code's files are deduplicated by message
-id. Codex's per-turn figures come from `last_token_usage`, not the cumulative
-total, so turns are never double-counted. Cache reads are kept apart from
+id across batches. Codex records `last_token_usage` once for each changed
+cumulative counter tuple, avoiding repeated `token_count` notifications.
+Counter resets retain the new per-turn usage. Timestamp ties do not discard replies.
+Cache reads are kept apart from
 uncached prompt, exactly as the providers bill them; cache *writes* are folded
 into the prompt figure at the plain input rate, which errs a few percent low.
 
 Agent tokens live in their own state file
 (`~/.local/state/omarchy/tokenstats/agents.json`) and **never** enter the
 local history or the savings figure. The Agents pane prices them per model
-from a table of published rates and labels the result an estimate.
+from an in-source rates table and labels the result an estimate.
+
+The panel footer reports backlog progress, rejected scans and skipped malformed
+or oversized records. Skipped records make totals incomplete; their tokens are
+never estimated. Unsafe paths, changed file identities and invalid cursors fail
+closed. A failed pass preserves both totals and its previous cursor. Usage and
+cursor state are written together, so restarting cannot apply one without the
+other. Version 1.5.1 rebuilds agent histories to remove the old scanner's possible
+duplicate counts; local history and live timing samples are preserved.
+
+Input, traversal, retained state, output, CPU time and wall time all have
+independent limits; see [SECURITY.md](SECURITY.md). A fresh large backlog can take
+several passes to finish. Progress is bounded even when a file contains a huge
+single JSONL record. Non-default Claude/Codex storage directories are currently
+unsupported.
 
 ## Savings
 
@@ -353,10 +362,11 @@ Verified: generating a 169-token completion moved the sampled figure from 113 to
 
 ## Cost of running it
 
-One `curl` per resident model per refresh against loopback — typically two —
-plus two `FileView` reads. The session list is read only when its pane is
-opened. No log tailing, no repeated multi-megabyte parse, and nothing polls the
-upstream while no model is resident.
+One loopback model-discovery request plus one `curl` per resident model per
+refresh. Agent scans run every two minutes when idle, every 15 seconds while
+catching up or while the panel is open. Each scan resumes its files at their
+saved offsets. OpenCode configuration is checked through a bounded reader every
+30 seconds. Session metadata is read on demand from the accumulated cursors.
 
 ## History format versions
 

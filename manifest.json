@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.erikburdett.tokenstats",
   "name": "Token Stats",
-  "version": "1.5.0",
+  "version": "1.5.1",
   "author": "Erik Burdett",
   "license": "MIT",
   "description": "Local LLM tokens per hour in the bar, with an exact-count graph, history, cloud comparison, and Claude Code / Codex agent tracking with a unified resumable sessions list",

@@ -13,9 +13,15 @@
 set -uo pipefail
 
 ENDPOINT="${1:-http://127.0.0.1:8080}"
-DB="${HOME}/.local/share/opencode/opencode.db"
+DB="${XDG_DATA_HOME:-$HOME/.local/share}/opencode/opencode.db"
 CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/opencode/opencode.json"
 STATE="${HOME}/.local/state/omarchy/tokenstats"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+if [[ ! $ENDPOINT =~ ^http://(127\.0\.0\.1|localhost|\[::1\])(:[0-9]{1,5})?$ ]]; then
+  printf '%s\n' 'Endpoint must be an HTTP loopback address.' >&2
+  exit 2
+fi
 
 bold() { printf '\033[1m%s\033[0m\n' "$1"; }
 ok()   { printf '  \033[92mok\033[0m    %s\n' "$1"; }
@@ -27,6 +33,7 @@ code() { curl -qsS --noproxy '*' --max-time 4 -o /dev/null -w '%{http_code}' "$1
 
 found_live=0
 found_import=0
+found_agent=0
 
 bold "Endpoint: $ENDPOINT"
 
@@ -81,7 +88,7 @@ bold "OpenCode records"
 
 if [[ ! -r $DB ]]; then
   no "no readable database at $DB"
-  info "Without it, live counters are the only possible source."
+  info "Local accounting needs live counters; Claude/Codex records remain independent."
 else
   ok "database found"
   rows=$(sqlite3 -readonly -safe -noinit -batch "file:$DB?mode=ro" \
@@ -90,19 +97,19 @@ else
 
   echo "        providers seen in the database:"
   sqlite3 -readonly -safe -noinit -batch -separator '  ' "file:$DB?mode=ro" \
-    "select '          ' || json_extract(data,'\$.providerID'), count(*)
+    "select '          ' || substr(json_extract(data,'\$.providerID'),1,64), count(*)
        from message where json_extract(data,'\$.role')='assistant'
       group by 1 order by 2 desc limit 10;" 2>/dev/null
 
   if [[ -r $CONFIG ]]; then
-    locals=$(python3 -c '
+    locals=$(/usr/bin/python3 -I -S "$SCRIPT_DIR/read-config.py" "$CONFIG" 2>/dev/null | /usr/bin/python3 -I -S -c '
 import json,sys,re
-try: cfg=json.load(open(sys.argv[1]))
+try: cfg=json.load(sys.stdin)
 except Exception: sys.exit()
 for pid,p in (cfg.get("provider") or {}).items():
     url=((p or {}).get("options") or {}).get("baseURL") or ""
     if re.match(r"^https?://(127\.0\.0\.1|localhost|\[::1\])(:|/|$)", url):
-        print(pid)' "$CONFIG" 2>/dev/null)
+        print(str(pid)[:64])' 2>/dev/null)
     if [[ -n $locals ]]; then
       ok "providers pointing at loopback, per opencode.json: $(echo "$locals" | tr '\n' ' ')"
       found_import=1
@@ -114,6 +121,21 @@ for pid,p in (cfg.get("provider") or {}).items():
     no "no opencode.json at $CONFIG"
     info "Without it the plugin cannot tell which providers are local."
   fi
+fi
+
+echo
+bold "Agent records"
+if [[ ! -x /usr/bin/python3 ]]; then
+  no "Python 3 is required for agent scanning and OpenCode configuration"
+else
+  for agent_dir in "$HOME/.claude/projects" "$HOME/.codex/sessions"; do
+    if [[ -d $agent_dir && ! -L $agent_dir ]]; then
+      ok "source directory present: $agent_dir"
+      found_agent=1
+    fi
+  done
+  info "The panel footer reports import progress, skipped records and capacity limits."
+  info "Directory presence alone does not establish readable usage records."
 fi
 
 echo
@@ -131,6 +153,8 @@ if (( found_live )); then
   ok "a live counter source is available"
 elif (( found_import )); then
   ok "no live counters, but OpenCode records can be imported"
+elif (( found_agent )); then
+  ok "agent source directories are present; check the Agents pane for scan results"
 else
   no "no usable source found — the widget will legitimately show nothing"
   info "Fix whichever line above says 'no', then restart: omarchy restart shell"

@@ -2,122 +2,133 @@
 
 ## Reporting a vulnerability
 
-Please report privately through GitHub's
-[security advisory form](https://github.com/ErikBurdett/omarchy-tokenstats/security/advisories/new)
-rather than a public issue. Include the affected commit, what you observed, and
-a safe reproduction if you have one. Please do not include credentials or
-exploit detail in a public thread.
+Use the [private advisory form](https://github.com/ErikBurdett/omarchy-tokenstats/security/advisories/new)
+for vulnerabilities. Include the affected commit and a safe reproduction; omit
+credentials, session transcripts and other private data from public issues.
 
-## What this plugin can reach
+## Runtime access
 
-It runs unsandboxed inside `omarchy-shell`, with your user's privileges. Being
-explicit about what it actually touches:
+Token Stats runs with the user's privileges inside `omarchy-shell`.
 
-| | |
+| Access | Scope |
 |---|---|
-| **Reads** | `/proc/meminfo`; llama-swap over loopback; OpenCode's database, **read-only** |
-| **Writes** | `~/.local/state/omarchy/tokenstats/` only |
-| **Runs** | `curl`, `sqlite3`, `install -d`, `omarchy-launch-tui` — absolute paths, argv arrays, no shell, cleared environment |
-| **Never** | writes user configuration, uses `sudo`/`pkexec`, installs anything, or reaches a non-loopback host |
+| Reads | `/proc/meminfo`; loopback llama.cpp/llama-swap endpoints; OpenCode's config and read-only database; default-location Claude Code/Codex JSONL logs |
+| Writes | `~/.local/state/omarchy/tokenstats/` only: history, panel overrides, agent totals and cursors |
+| Commands | Absolute `/usr/bin/curl`, `/usr/bin/sqlite3`, `/usr/bin/python3`, `/usr/bin/install`, `/usr/bin/omarchy-launch-tui` |
 
-## Boundaries that are deliberate
+No sudo or pkexec is required. The plugin does not install software, rewrite
+`shell.json` or the tools' configurations, or download and execute code. The
+manual clone instructions and optional server restart command in the README
+are user actions, not widget actions.
 
-### Loopback really means loopback
+## Bounded agent scanning
 
-The endpoint setting is pattern-matched to `127.0.0.1`/`localhost`, so a
-`shell.json` edit cannot redirect the fetch. **That check alone is not
-sufficient**, and the environment is why:
+`scripts/scan-agents.py` replaces the former shell/find/sort/jq/head pipeline.
+Python runs with `-I -S` and a cleared environment: no user site packages,
+startup customization, inherited search paths or subprocess commands. The
+scanner creates a private session and starts **no descendants or threads**.
 
-- `curl` honours `http_proxy`, `https_proxy` and `ALL_PROXY`, and reads
-  `~/.curlrc`. Either one sends a loopback URL to an arbitrary host. Verified on
-  a development machine: with `http_proxy` exported and no `--noproxy`, curl
-  connects to the proxy rather than to `127.0.0.1`.
-- So every `curl` runs with `clearEnvironment: true` and an empty environment,
-  plus `--noproxy '*'` (ignore any proxy configuration) and `-q` (ignore
-  `~/.curlrc`). Three independent reasons the request cannot leave the machine.
+It walks directories incrementally, pins directories and opens log files with
+`O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC`, and validates the descriptor actually
+read with `fstat`. Symlinks and special files cannot redirect or block reads.
+Checks on file identity and prior bytes reject replaced/truncated logs rather
+than silently replaying them.
 
-### sqlite3 cannot be steered by a config file either
+The scanner has independent limits on file bytes per pass, total bytes per
+pass, line length, line count, directory traversal, output rows, cursor state,
+serialized output, CPU time, address space and wall time. Large files resume
+at persisted offsets. A long single record is discarded in bounded chunks;
+the persistent skipped-record count keeps the result marked incomplete.
+Malformed records are also explicitly reported as incomplete.
 
-`sqlite3` reads `$XDG_CONFIG_HOME/sqlite3/sqliterc`, else `~/.sqliterc`, and
-executes its meta-commands *before* the query. Every invocation therefore uses
-`-noinit` (refuse that file), `-safe` (refuse anything that could write, attach
-or shell out), `-readonly`, and a `file:...?mode=ro` URI — with an empty
-environment, so there is no `XDG_CONFIG_HOME` to point anywhere.
-
-### Output is bounded at the producer, not after collection
-
-`StdioCollector { waitForEnd: true }` buffers the complete stream before any
-plugin code runs, so checking a length afterwards is not a cap. The bound is on
-the producer in every case:
-
-| Reader | Producer-side bound |
+| Budget | Limit |
 |---|---|
-| `curl` | `--max-filesize 262144` and `--max-time 4`. Both llama-swap endpoints send `Content-Length`, so an oversized body is refused before the transfer starts (verified: exit 63). |
-| `sqlite3` import | `LIMIT 20000` rows; the one text column wrapped in `substr(...,1,64)`. Everything else selected is an integer. |
-| `sqlite3` sessions | `LIMIT 60` rows; every text column wrapped in `substr` (80/200/64/400/160 characters). |
+| Log bytes per file / per pass | 16 MiB / 128 MiB, including buffered read-ahead; cursor anchors additionally read at most 256 bytes before and after each file |
+| JSONL record / line count | 256 KiB per record; 50,000 lines per file and 500,000 per pass |
+| Traversal / retained files | 4,096 entries, depth 16, 400 files |
+| Retained Claude IDs / output usage rows | 16,384 IDs / 2,000 rows per pass |
+| Cursor input / serialized output | 2 MiB / 4 MiB |
+| Wall / CPU / address space | 8 seconds / 8 seconds soft and 9 seconds hard / 256 MiB |
 
-Each parser then applies a second, independent cap on length, line count and
-row count, so a malformed or hostile response is bounded twice.
+Byte/row work limits resume on later passes. File, traversal, depth and
+deduplication capacity limits need a smaller source set and are reported as
+limits, not as a promise that another pass will finish.
 
-### Process execution
+No complete log, directory listing or session-event array is materialized.
+Sessions are derived from bounded metadata accumulated during usage scans.
+Claude message IDs are hashed and retained within a fixed deduplication bound;
+Codex repeated cumulative counters add no duplicate usage. A cursor bound is
+an explicit failure, never permission to discard deduplication state.
 
-Absolute paths (`/usr/bin/curl`, `/usr/bin/sqlite3`, `/usr/bin/install`,
-`/usr/bin/omarchy-launch-tui`), fixed argv arrays, no shell anywhere, and no
-`PATH` lookup. Model ids that reach a URL path are **validated** against
-`^[A-Za-z0-9._-]{1,40}$` and dropped if they do not match — not sanitised, since
-a repaired id would still be requested, just for the wrong model.
+Each accepted batch carries validated rows and a revisioned cursor. The model
+validates the complete envelope before applying either. Totals and cursor are
+saved in the same atomic state file; failed scans and replayed revisions leave
+both unchanged. Timestamps are bucket labels, not the import deduplication key.
 
-Every reader has a watchdog `Timer` that sends `SIGTERM` then `SIGKILL` and
-clears `running`, wired to `Component.onDestruction` as well. `curl`, `sqlite3`
-and `install` fork no children, so the process and its group are the same thing
-and that is a complete teardown.
+## Process cancellation and reaping
 
-The session launcher is the exception and is deliberate: `omarchy-launch-tui`
-execs `setsid uwsm-app -- xdg-terminal-exec`, so the terminal is in its own
-session and outlives the plugin *by design* — that is what "open a terminal"
-means. Only the short-lived wrapper is tracked, and it is not killed at
-destruction, because doing so would race a terminal the user just asked for and
-would not reach the detached session anyway. It still has a watchdog so a wedged
-exec cannot block the next click.
+Every reader, including state-directory creation, has a QML watchdog. A
+watchdog sends TERM, allows a two-second grace period, and sends KILL only if
+that same Process still has the cancelled PID. It cannot kill a replacement
+invocation or another reader. The helpers also enforce their own deadlines.
 
-It is also the one process that needs a session to talk to, so it cannot run
-with an empty environment. It gets an explicit allow-list — `HOME`, `USER`,
-`XDG_RUNTIME_DIR`, `WAYLAND_DISPLAY`, `HYPRLAND_INSTANCE_SIGNATURE`,
-`DBUS_SESSION_BUS_ADDRESS`, `XDG_CURRENT_DESKTOP`, `XDG_SESSION_TYPE`, `LANG` —
-and a **fixed `PATH` of `/usr/local/bin:/usr/bin`**, because
-`omarchy-launch-tui` resolves `setsid`, `uwsm-app` and `xdg-terminal-exec`
-through `PATH` and an inherited one is the single place a user-writable
-directory could decide what actually runs.
+On widget destruction, callbacks are prevented from starting more work and
+all readers are terminated immediately. Quickshell's `Process` owns and reaps
+each direct child. In particular, the scanner's PID is the **only member of its
+private process group**: there are no `find`, `sort`, `jq`, shell or `head`
+children to survive a parent-only signal. Destruction cannot defer cleanup to
+a QML timer that is being destroyed. Immediate KILL on destruction covers the
+whole scanner group because that group contains exactly one process.
 
-It launches `~/.local/share/mise/shims/opencode`, which is under `$HOME` and so
-user-writable. That is not a privilege boundary here: nothing in this plugin is
-ever privileged, it already runs with the user's own rights, and the target is
-the user's own interpreter shim — the thing they asked to open. There is no
-authorization for a swapped pathname to be spent against.
+The terminal launcher is a deliberate user action. It starts an independent
+terminal session, which outlives the popup; closing the popup does not close
+the user's terminal. Its short-lived wrapper has a watchdog. Session IDs are
+validated before entering argv; the working directory is a Process property,
+not shell text. The tools' absolute mise shim paths are user-owned code run
+with the user's existing privileges, with no privilege transition.
 
-### Files
+## Loopback and SQLite
 
-- `/proc/meminfo` is a kernel file. The state file lives in a directory the
-  plugin creates with `install -d -m 700`, which sets the mode on an existing
-  directory too — so an install predating that change is corrected rather than
-  left at `0755` forever. Nothing else can place a symlink or a FIFO there
-  without already being this user.
-- `FileView` does read a whole file before any size check, which is why it is
-  pointed only at those two paths and never at anything another party writes.
-  `parseHistory` rejects input over 4 MiB, rejects any version but the current
-  one, and validates every key against a date pattern and every value for type,
-  sign, finiteness and cardinality before it reaches a runtime value or a
-  `Repeater`.
-- Writes go through `FileView.atomicWrites` (temporary file plus rename), so a
-  crash or a full disk cannot leave a half-written state file behind.
-- **Persisted state is never executed.** It is JSON, parsed with `JSON.parse`,
-  and every field is treated as untrusted data.
+Endpoint overrides and discovered model IDs are validated at use. Every curl
+runs with a cleared environment, `-q`, `--noproxy '*'`, `--max-time 4`, and
+`--max-filesize 262144`. No redirects are followed. Proxy environment variables
+and curl startup files cannot change the request destination.
 
-### Untrusted text
+SQLite runs with a cleared environment and `-readonly -safe -noinit -batch`,
+against a `mode=ro` URI. Queries limit rows and text-column lengths; selected
+numeric JSON values are cast to integers, so a string in an alleged token
+field cannot bypass the producer's byte bound. Provider IDs are validated
+immediately before building the `IN` clause; invalid-only lists select nothing.
+The import fetches one overflow row and commits only complete timestamp groups,
+so a full batch cannot advance coverage past unscanned replies.
 
-Every one of the 21 `Text` elements in the panel sets
-`textFormat: Text.PlainText`. Session titles, working directories and model
-names come from OpenCode's database and llama-swap, and none of them is
-authored by this plugin.
+The launcher alone receives an allow-list of desktop session variables and a
+fixed `/usr/local/bin:/usr/bin` PATH, for Omarchy's own terminal launcher.
 
-If you find somewhere these do not hold, that is worth reporting.
+## Configuration, storage and UI
+
+OpenCode configuration is read by `scripts/read-config.py`, not `FileView`.
+The helper opens every path component without following symlinks, requires an
+owned regular file, and reads at most 256 KiB plus one overflow byte. JSON
+structure is bounded to depth 64 and 16,384 values; its wall deadline is three
+seconds. Invalid or unavailable configuration yields no providers. Symlinked
+XDG config paths must be configured using their resolved real path.
+
+`FileView` is used only for kernel memory data and plugin-owned state. The
+plugin creates its state directory with mode 0700 and writes JSON atomically
+through `FileView.atomicWrites`. State is parsed as data, never executed; schema,
+version, finite numeric values, key lengths and collection sizes are validated.
+Agent histories have a separate format version, so an agent import repair does
+not discard local throughput history.
+
+The plugin's state directory is user-controlled. `FileView` loads owned state
+before the model's parse limits (4 MiB local history, 16 MiB combined agent
+histories and cursors); it is not claimed to provide a bounded
+reader for arbitrary third-party files. Protecting against another program
+running as the same user replacing this private state remains outside that
+storage boundary.
+
+Settings from both the panel and `shell.json` pass the same coercion rules;
+invalid numbers fall back rather than reaching timers as NaN. Model identifiers
+cannot collide with JavaScript prototype keys. All external text in the panel
+is rendered with `Text.PlainText`.
