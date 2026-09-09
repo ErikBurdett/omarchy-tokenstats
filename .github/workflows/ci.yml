@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4.3.0
         with:
           persist-credentials: false
 
@@ -56,7 +56,7 @@ jobs:
       - name: Install Qt QML tooling
         run: pacman -Syu --noconfirm --needed qt6-declarative quickshell git
 
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4.3.0
         with:
           persist-credentials: false
 
@@ -65,7 +65,7 @@ jobs:
       # checked out beside the plugin. Pinned to a commit: an unpinned lint
       # dependency turns an upstream edit into a red build on an untouched PR.
       - name: Check out the Omarchy shell that supplies qs.Commons and qs.Ui
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4.3.0
         with:
           repository: basecamp/omarchy
           ref: 346e69e1cec6c4e8924531874af6ba010a1bc99e # v4.0.2
